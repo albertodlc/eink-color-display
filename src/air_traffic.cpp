@@ -45,7 +45,7 @@ constexpr int16_t kGridGapY = 8;
 constexpr int16_t kPhotoW = 320;
 constexpr int16_t kPhotoH = 128;
 constexpr uint16_t kPhotoBytes = (kPhotoW * kPhotoH * 3 + 7) / 8 + 2;
-constexpr size_t kJpegBufferSize = 16 * 1024;
+constexpr size_t kJpegBufferSize = 32 * 1024;
 
 // Measured Spectra 6 appearance (Zephyr reTerminal E1002 reference panel).
 // If this panel looks too bright, try the darker approximation used by the
@@ -429,9 +429,14 @@ int jpeg_draw_callback(JPEGDRAW* draw) {
       if (tx1 >= kPhotoW) tx1 = kPhotoW - 1;
 
       const uint16_t rgb565 = draw->pPixels[yy * draw->iWidth + xx];
-      const uint8_t r = (uint8_t)(((rgb565 >> 11) & 0x1F) << 3);
-      const uint8_t g = (uint8_t)(((rgb565 >> 5) & 0x3F) << 2);
-      const uint8_t b = (uint8_t)((rgb565 & 0x1F) << 3);
+      // Replicate the high bits into the low bits so 5/6-bit channels use
+      // the full 0-255 range instead of stopping at 248/252.
+      const uint8_t r5 = (uint8_t)((rgb565 >> 11) & 0x1F);
+      const uint8_t g6 = (uint8_t)((rgb565 >> 5) & 0x3F);
+      const uint8_t b5 = (uint8_t)(rgb565 & 0x1F);
+      const uint8_t r = (uint8_t)((r5 << 3) | (r5 >> 2));
+      const uint8_t g = (uint8_t)((g6 << 2) | (g6 >> 4));
+      const uint8_t b = (uint8_t)((b5 << 3) | (b5 >> 2));
       const uint8_t index =
           photo_index_dither(r, g, b, (int16_t)tx0, (int16_t)ty0);
       for (int ty = ty0; ty <= ty1; ty++) {

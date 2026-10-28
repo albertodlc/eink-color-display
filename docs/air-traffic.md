@@ -151,9 +151,10 @@ photo for the aircraft family: narrowbody (A320/B737/B757), widebody (A330),
 regional jet (E190), turboprop (ATR 72/Dash 8), business jet (Citation CJ3),
 light single (Cessna 172) and helicopter (AW139). Sources and licences are in
 [`assets/aircraft/ATTRIBUTION.md`](../assets/aircraft/ATTRIBUTION.md). Live
-thumbnails are decoded at 320x128 and mapped to the six inks. The bundled
-fallbacks are stored as smooth 480x192 RGB332 data and Floyd-Steinberg dithered
-at the final card resolution.
+thumbnails are decoded at 320x128, expanded from RGB565 to 8-bit channels with
+bit replication, and mapped to the six inks. The bundled fallbacks are stored as
+smooth 480x192 RGB332 data and Floyd-Steinberg dithered at the final card
+resolution.
 
 ## Configuration
 
