@@ -65,15 +65,18 @@ constexpr int16_t kMapDisplayH = epd::kHeight;
 constexpr int16_t kMapCenterX = kMapDisplayW / 2;
 constexpr int16_t kMapCenterY = 256;
 constexpr int16_t kMapOffsetY = 16;
-// The background is rendered at 600x360 (54 KB) to keep a large contiguous
-// allocation safe after Wi-Fi/TLS fragmentation, then scaled to 800x480.
-constexpr int16_t kMapBufferW = 600;
-constexpr int16_t kMapBufferH = 360;
+// The background is 800x480 at two bits per pixel. It is split into four
+// 24 KB blocks so it can be allocated after Wi-Fi/TLS fragmentation.
+constexpr int16_t kMapBufferW = 800;
+constexpr int16_t kMapBufferH = 480;
 constexpr uint16_t kMapRowBytes = kMapBufferW / 4;
-constexpr uint32_t kMapBytes = (uint32_t)kMapRowBytes * kMapBufferH;
+constexpr uint8_t kMapBlockCount = 4;
+constexpr uint16_t kMapBlockRows = kMapBufferH / kMapBlockCount;
+constexpr uint32_t kMapBlockBytes = kMapRowBytes * kMapBlockRows;
+constexpr uint32_t kMapBytes = kMapBlockBytes * kMapBlockCount;
 constexpr int16_t kMapQuantum = 200;  // 0.005 deg, matches the generator
 
-uint8_t* g_map_pixels = nullptr;
+uint8_t* g_map_blocks[kMapBlockCount] = {};
 bool g_map_ready = false;
 int32_t g_q_lon_min = 0;
 int32_t g_q_lon_max = 0;
@@ -2750,8 +2753,13 @@ void draw_plane_symbol(epd::Display& display, int16_t x, int16_t y,
 const uint16_t kMapColors[4] = {GxEPD_WHITE, GxEPD_BLUE, GxEPD_GREEN,
                                 GxEPD_BLACK};
 
+uint8_t* map_row(int16_t y) {
+  return g_map_blocks[y / kMapBlockRows] +
+         (size_t)(y % kMapBlockRows) * kMapRowBytes;
+}
+
 uint8_t map_pixel(int16_t x, int16_t y) {
-  const uint8_t packed = g_map_pixels[(size_t)y * kMapRowBytes + (x >> 2)];
+  const uint8_t packed = map_row(y)[x >> 2];
   return (uint8_t)((packed >> ((x & 3) * 2)) & 3);
 }
 
@@ -2759,10 +2767,10 @@ void map_set_pixel(int16_t x, int16_t y, uint8_t index) {
   if (x < 0 || x >= kMapBufferW || y < 0 || y >= kMapBufferH) {
     return;
   }
-  const size_t byte = (size_t)y * kMapRowBytes + (x >> 2);
+  uint8_t* row = map_row(y);
   const uint8_t shift = (uint8_t)((x & 3) * 2);
-  g_map_pixels[byte] =
-      (uint8_t)((g_map_pixels[byte] & ~(3u << shift)) | (index << shift));
+  const uint16_t byte = (uint16_t)(x >> 2);
+  row[byte] = (uint8_t)((row[byte] & ~(3u << shift)) | (index << shift));
 }
 
 void map_fill_span(int16_t y, int16_t x0, int16_t x1, uint8_t index) {
@@ -2974,7 +2982,7 @@ void draw_map_places() {
 }
 
 bool prepare_vector_map(const AirTrafficData& data) {
-  if (g_map_ready && g_map_pixels) return true;
+  if (g_map_ready && g_map_blocks[0]) return true;
 
   const float half_lat = data.radius_km * 1.1f / 111.32f;
   float cos_lat = cosf((float)data.lat * PI / 180.0f);
@@ -2993,17 +3001,27 @@ bool prepare_vector_map(const AirTrafficData& data) {
   if (g_q_lon_max <= g_q_lon_min || g_q_lat_max <= g_q_lat_min) return false;
   g_map_m_per_px = 2.0f * half_lat * 111320.0f / (float)kMapDisplayH;
 
-  if (!g_map_pixels) {
-    g_map_pixels = (uint8_t*)malloc(kMapBytes);
-  }
-  if (!g_map_pixels) {
-    Serial.printf("[air] map buffer: allocation failed, heap %u, largest %u\n",
-                  (unsigned)ESP.getFreeHeap(),
-                  (unsigned)ESP.getMaxAllocHeap());
-    return false;
+  if (!g_map_blocks[0]) {
+    bool allocated = true;
+    for (uint8_t i = 0; i < kMapBlockCount; i++) {
+      g_map_blocks[i] = (uint8_t*)malloc(kMapBlockBytes);
+      if (!g_map_blocks[i]) allocated = false;
+    }
+    if (!allocated) {
+      Serial.printf("[air] map buffer: allocation failed, heap %u, largest %u\n",
+                    (unsigned)ESP.getFreeHeap(),
+                    (unsigned)ESP.getMaxAllocHeap());
+      for (uint8_t i = 0; i < kMapBlockCount; i++) {
+        free(g_map_blocks[i]);
+        g_map_blocks[i] = nullptr;
+      }
+      return false;
+    }
   }
 
-  memset(g_map_pixels, 0, kMapBytes);
+  for (uint8_t i = 0; i < kMapBlockCount; i++) {
+    memset(g_map_blocks[i], 0, kMapBlockBytes);
+  }
   const uint32_t started = millis();
   fill_ocean();
   // District boundaries first, then country borders and coastlines on top.
@@ -3074,21 +3092,15 @@ void draw_real_map_background(epd::Display& display, int16_t page_top,
   const int16_t last =
       page_bottom > kMapDisplayH ? kMapDisplayH : page_bottom;
   for (int16_t y = first; y < last; y++) {
-    const int16_t sy =
-        (int16_t)(((int32_t)(y - kMapOffsetY) * kMapBufferH) /
-                  kMapDisplayH);
+    const int16_t sy = (int16_t)(y - kMapOffsetY);
     if (sy < 0 || sy >= kMapBufferH) continue;
 
     int16_t x = 0;
     while (x < kMapDisplayW) {
-      const int16_t sx =
-          (int16_t)(((int32_t)x * kMapBufferW) / kMapDisplayW);
-      const uint8_t index = map_pixel(sx, sy);
+      const uint8_t index = map_pixel(x, sy);
       int16_t run = 1;
-      while (x + run < kMapDisplayW) {
-        const int16_t next_sx =
-            (int16_t)(((int32_t)(x + run) * kMapBufferW) / kMapDisplayW);
-        if (map_pixel(next_sx, sy) != index) break;
+      while (x + run < kMapDisplayW &&
+             map_pixel((int16_t)(x + run), sy) == index) {
         run++;
       }
       display.drawFastHLine(x, y, run, kMapColors[index]);
@@ -3251,7 +3263,7 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
 
 void draw_map_page(epd::Display& display, const AirTrafficData& data,
                    int16_t page_top, int16_t page_bottom) {
-  if (!g_map_ready || !g_map_pixels) {
+  if (!g_map_ready || !g_map_blocks[0]) {
     if (intersects(200, 240, page_top, page_bottom)) {
       draw_centered(display, 0, 210, epd::kWidth, "MAP DATA UNAVAILABLE", 2,
                     GxEPD_BLACK);
@@ -3496,11 +3508,15 @@ void airTrafficRun(epd::Display& display) {
     return;
   }
   const bool fetched = fetch_traffic(*data, config);
-  // The radio is not needed while the panel refreshes (~26 s).
-  // disconnect(true) already powers the interface down; calling
-  // WiFi.mode(WIFI_OFF) as well triggers an "un-init" driver warning.
+  // The radio is not needed while the panel refreshes (~26 s). WIFI_OFF also
+  // releases enough contiguous heap for the 800x480 map buffer; the driver may
+  // log a harmless "un-init" warning.
   WiFi.disconnect(true);
-  Serial.printf("[air] free heap %u bytes\n", (unsigned)ESP.getFreeHeap());
+  WiFi.mode(WIFI_OFF);
+  delay(50);
+  Serial.printf("[air] free heap %u bytes, largest %u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)ESP.getMaxAllocHeap());
   Serial.flush();
   if (fetched) {
     const uint32_t start = millis();

@@ -305,10 +305,10 @@ map are included. Poster modes keep the configured radius. The firmware draws:
   the grid contains more than the 40 stored aircraft.
 
 There is no range circle or other legend over the map. The vector image is
-rasterised once per wake into a 54 KB two-bit buffer at 600x360, scaled to the
-800x480 panel, which takes about 6.7 s on the ESP32; the panel refresh still
-dominates the wake. If the buffer cannot be allocated, the panel shows
-`MAP DATA UNAVAILABLE`.
+rasterised once per wake into a 96 KB two-bit buffer at 800x480 (split into four
+24 KB blocks for heap reliability), which takes about 8.9 s on the ESP32; the
+panel refresh still dominates the wake. If the buffer cannot be allocated, the
+panel shows `MAP DATA UNAVAILABLE`.
 
 The source is Natural Earth: 1:50m ocean polygons, country borders and rivers,
 plus 1:10m first-order district boundaries, district labels and populated
@@ -400,12 +400,12 @@ disconnected:
 ```text
 [air] view mode 6
 [air] 37 aircraft in map view (37 stored)
-[air] vector map q=-1035..-130, 8463..8858 in 6653 ms, heap 124324
+[air] vector map q=-1035..-130, 8463..8858 in 8939 ms, heap 81104
 [air] render total 35852 ms (panel 26233 ms)
 ```
 
-The background is a 600x360 two-bit buffer (54 KB) with four inks, scaled to
-the 800x480 panel. There is no map download and no JPEG decode, so no PSRAM is
+The background is an 800x480 two-bit buffer (96 KB, four 24 KB blocks) with
+four inks. There is no map download and no JPEG decode, so no PSRAM is
 required.
 
 ## Limitations
@@ -424,8 +424,8 @@ required.
   names and major city names. City names use a lower-contrast green; aircraft
   identifiers use black labels, white text and country flags. It deliberately
   omits roads and raster tile labels, so it is cleaner but less detailed than a
-  street map. The 54 KB map buffer is allocated after Wi-Fi is disconnected; if
-  that fails the panel shows `MAP DATA UNAVAILABLE`.
+  street map. The 96 KB map buffer is allocated in four 24 KB blocks after
+  Wi-Fi is disconnected; if that fails the panel shows `MAP DATA UNAVAILABLE`.
 - TLS certificate verification is disabled (`setInsecure()`) because the
   firmware does not ship a CA bundle. The feed is public and read-only, but a
   man-in-the-middle could alter the displayed data. The public image proxy
