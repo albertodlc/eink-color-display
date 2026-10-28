@@ -2597,8 +2597,14 @@ void draw_header(epd::Display& display, const AirTrafficData& data) {
   // the map rectangle for map mode), not just the nearest stored ones.
   char title[80];
 #if AIR_TRAFFIC_MODE == 6
-  snprintf(title, sizeof(title), "MAP VIEW - %u AIRCRAFT IN THE AIR NOW",
-           (unsigned)data.total_within_radius);
+  if (data.count < data.total_within_radius) {
+    snprintf(title, sizeof(title),
+             "MAP VIEW - %u OF %u AIRCRAFT IN THE AIR NOW",
+             (unsigned)data.count, (unsigned)data.total_within_radius);
+  } else {
+    snprintf(title, sizeof(title), "MAP VIEW - %u AIRCRAFT IN THE AIR NOW",
+             (unsigned)data.count);
+  }
 #else
   snprintf(title, sizeof(title),
            "WITHIN %.0f KM - %u AIRCRAFT IN THE AIR NOW", data.radius_km,
@@ -3042,7 +3048,7 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
 
   // District names are black; city names are deliberately a lower-contrast
   // green. Aircraft identifiers get their own black labels with flags.
-  MapLabelRect used[24];
+  MapLabelRect used[40];
   uint8_t used_count = 0;
 
   uint8_t district_labels = 0;
@@ -3146,7 +3152,7 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
       if (intersects(label_y - 2, label_y + 11, page_top, page_bottom)) {
         draw_aircraft_label(display, label_x, label_y, label, flag);
       }
-      if (used_count < 24) {
+      if (used_count < 40) {
         used[used_count++] = {label_x - 2, label_y - 2,
                               (int16_t)(label_w + 4), 13};
       }

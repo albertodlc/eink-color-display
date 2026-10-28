@@ -152,8 +152,9 @@ The page imitates a framed print:
   side-view photo for the aircraft family is used. Sources and licences are in
   [`assets/aircraft/ATTRIBUTION.md`](../assets/aircraft/ATTRIBUTION.md).
 - The header count is the total within the radius in poster modes and within
-  the map rectangle in map mode; the display shows the nearest aircraft that
-  fit or the nearest ten in map mode.
+  the map rectangle in map mode. The display shows the nearest aircraft that
+  fit in poster modes, or up to 40 in map mode; if the map grid has more, the
+  header shows `shown of total`.
 
 The details line uses the route when adsbdb knows it (`Dublin to Milan`) and
 `12 km / 210 deg` otherwise. Routes are often missing for positioning, ferry
@@ -199,7 +200,7 @@ Compile-time defaults live in `include/air_traffic_config.h`:
 | `AIR_TRAFFIC_RADIUS_KM` | 100 | Default radius on first boot |
 | `AIR_TRAFFIC_UPDATE_S` | 300 | Deep-sleep interval |
 | `AIR_TRAFFIC_SLEEP` | 1 | Set to 0 to disable deep sleep |
-| `AIR_TRAFFIC_MAX_AIRCRAFT` | 10 | Nearest aircraft kept while parsing |
+| `AIR_TRAFFIC_MAX_AIRCRAFT` | 10 | Nearest aircraft kept while parsing (40 in map mode) |
 | `AIR_TRAFFIC_PAGE_AIRCRAFT` | 5 | Maximum cards any mode can draw |
 | `AIR_TRAFFIC_MODE` | 0 | 0 auto, 1 demo, 2 one, 3 two, 4 three, 5 five, 6 map |
 | `AIR_TRAFFIC_ACTIVE_CARDS` | mode-dependent | Cards drawn by the selected mode |
@@ -288,8 +289,8 @@ map are included. Poster modes keep the configured radius. The firmware draws:
 - each aircraft at its ADS-B distance and bearing, rotated by its ground track;
 - aircraft callsigns on black labels with white text and a small country flag;
 - the home marker, north and `(c) Natural Earth`;
-- the `MAP VIEW - N AIRCRAFT` header, where N counts aircraft in the map
-  rectangle.
+- the `MAP VIEW - N AIRCRAFT` header, or `MAP VIEW - N OF M AIRCRAFT` when
+  the grid contains more than the 40 stored aircraft.
 
 There is no range circle or other legend over the map. The vector image is
 rasterised once per wake into a 54 KB two-bit buffer at 600x360, scaled to the
@@ -381,9 +382,9 @@ Map mode rasterises the embedded Natural Earth vectors after Wi-Fi is
 disconnected:
 
 ```text
-[air] 38 aircraft in map view (10 stored)
-[air] vector map q=-1035..-130, 8463..8858 in 6666 ms, heap 127824
-[air] render total 35692 ms (panel 26231 ms)
+[air] 37 aircraft in map view (37 stored)
+[air] vector map q=-1035..-130, 8463..8858 in 6653 ms, heap 124324
+[air] render total 35852 ms (panel 26233 ms)
 ```
 
 The background is a 600x360 two-bit buffer (54 KB) with four inks, scaled to

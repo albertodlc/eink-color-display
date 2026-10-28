@@ -47,7 +47,11 @@
 #define AIR_TRAFFIC_RADIUS_KM 100
 #define AIR_TRAFFIC_UPDATE_S 300  // >= 180 s vendor recommendation
 #define AIR_TRAFFIC_SLEEP 1       // deep sleep between updates
-#define AIR_TRAFFIC_MAX_AIRCRAFT 10
+#if AIR_TRAFFIC_MODE == 6
+#  define AIR_TRAFFIC_MAX_AIRCRAFT 40  // map view has room for more markers
+#else
+#  define AIR_TRAFFIC_MAX_AIRCRAFT 10
+#endif
 #define AIR_TRAFFIC_PAGE_AIRCRAFT 5  // maximum cards any mode can draw
 
 #if AIR_TRAFFIC_MODE == 2
