@@ -117,8 +117,10 @@ The page is a print-style poster rather than a radar:
   the next. The single-aircraft layout also shows a country flag, the
   registration/distance and a recent-route column. Ground aircraft are marked
   `on the ground`.
-- Mode 6 draws a real street map centred on the configured location, with the
-  aircraft plotted at their distance and bearing and oriented by their track.
+- Mode 6 draws a clean vector map centred on the configured location, with
+  the aircraft plotted at their distance and bearing and oriented by their
+  track. The map uses embedded Natural Earth coastlines, borders, rivers and a
+  few city names, so it has no tile-service labels or raster artifacts.
 - The feed supplies the callsign, type, altitude, vertical rate and position.
 - The header count is the total within the radius; the poster shows as many
   aircraft as the selected display mode allows (four by default).
@@ -143,7 +145,7 @@ data source, portal, layout and limitations.
 | `3` | Two live aircraft |
 | `4` | Three live aircraft |
 | `5` | Five live aircraft (3 on top, 2 centred below) |
-| `6` | Real street map centred on the configured location and radius |
+| `6` | Vector map centred on the configured location and radius |
 
 ```bash
 PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=2" pio run -t upload
@@ -155,11 +157,11 @@ PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=1 -DAIR_TRAFFIC_DEMO_COUNT=5" \
 The demo feed renders the sample aircraft from the Overhead reference print
 without using adsb.lol. It may briefly join Wi-Fi to fetch card photos. The
 board does not deep-sleep in demo mode, so press RESET to redraw. Live modes
-fetch the feed and deep-sleep as usual. Mode 6 downloads one ArcGIS street-map
-image per wake and overlays the aircraft; if the map cannot be fetched or
-decoded it falls back to a range-ring radar. Flash without the flag to return
-to mode 0. The legacy `-DAIR_TRAFFIC_DEMO=1` flag is still accepted as an alias
-for mode 1; the sample aircraft are in `fill_demo_data()` in
+fetch the feed and deep-sleep as usual. Mode 6 renders the map on-device from
+embedded Natural Earth data, so it makes no map HTTP request; if the map buffer
+cannot be allocated it shows `MAP DATA UNAVAILABLE`. Flash without the flag to
+return to mode 0. The legacy `-DAIR_TRAFFIC_DEMO=1` flag is still accepted as an
+alias for mode 1; the sample aircraft are in `fill_demo_data()` in
 `src/air_traffic.cpp`.
 
 ## Refresh timing
@@ -200,8 +202,10 @@ src/main.cpp                   Panel init, OTP test modes, air-traffic entry poi
 src/air_traffic.cpp            Wi-Fi portal, adsb.lol fetch, poster renderer
 src/fallback_photos.h          RGB332 fallback photos (PROGMEM)
 src/flags.h                    Generated country flags for registrations
+src/vector_map.h               Generated Natural Earth vector map data
 tools/make_fallback_photos.py  Fallback photo cropper/RGB332 packer (Pillow)
 tools/make_flags.py            Flag downloader/quantiser/packer (Pillow)
+tools/make_vector_map.py       Natural Earth vector map packer
 tools/dump_otp.py              Serial OTP dump capture (pyserial)
 docs/hardware.md               Board, panel, pinout and assembly
 docs/air-traffic.md            Standalone air-traffic mode and poster layout

@@ -204,7 +204,7 @@ validated before they are saved.
 | `3` | 2 | two feature rows |
 | `4` | 3 | 2x2 grid with the last card centred |
 | `5` | 5 | three on top, two centred below |
-| `6` | live, up to 10 | real street map with aircraft markers |
+| `6` | live, up to 10 | vector map with aircraft markers |
 
 ```bash
 PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=2" pio run -t upload
@@ -256,21 +256,26 @@ unchanged.
 
 #### Map mode
 
-Mode 6 requests a street-map export from Esri ArcGIS centred on the configured
-latitude/longitude. The export covers 10% more than the selected radius and
-has the same 5:3 aspect as the panel. The firmware then draws:
+Mode 6 renders a clean vector map centred on the configured latitude/longitude
+from the Natural Earth 1:50m dataset embedded in the firmware. It makes no map
+HTTP request. The map covers 10% more than the selected radius and has the same
+5:3 aspect as the panel. The firmware draws:
 
-- the map background quantised to four inks (land, water, parks, roads/labels);
-- a black range circle at the configured radius;
+- white land, blue water, black coastlines, green land borders and blue rivers;
+- a small set of major city names from Natural Earth (no tile-service labels);
 - each aircraft at its ADS-B distance and bearing, rotated by its ground track;
-- callsigns on white labels, the centre coordinates and map attribution;
+- callsigns on white labels, the home marker, north and `(c) Natural Earth`;
 - the usual `WITHIN ... KM - N AIRCRAFT` header.
 
-The map is downloaded as a 400x240 JPEG (about 25 KB) and decoded into a 24 KB
-two-bit buffer, then scaled to the 800x480 panel. One HTTPS request is made per
-wake. If the request or decode fails, the firmware falls back to the range-ring
-radar view so the aircraft are still visible. Map data: Esri World Street Map
-(Esri, HERE, Garmin, OpenStreetMap contributors and others).
+There is no range circle or other legend over the map. The vector image is
+rasterised once per wake into a 96 KB two-bit buffer at 800x480, which takes
+about 8.5 s on the ESP32; the panel refresh still dominates the wake. If the
+buffer cannot be allocated, the panel shows `MAP DATA UNAVAILABLE`.
+
+The source is Natural Earth 1:50m ocean polygons, land borders, rivers and
+populated places (public domain). It is intentionally sparse: no roads, no
+raster tiles and no tile-provider labels. Regenerate `src/vector_map.h` with
+`python3 tools/make_vector_map.py`.
 
 ## Partition and dependencies
 
@@ -345,18 +350,16 @@ image : air traffic (demo)
 The demo panel hibernates but the ESP32 stays awake, so the image remains and
 RESET redraws it.
 
-Map mode fetches one ArcGIS street-map JPEG and decodes it after Wi-Fi is
+Map mode rasterises the embedded Natural Earth vectors after Wi-Fi is
 disconnected:
 
 ```text
-[air] map bbox -5.1764,42.3160 - -0.6502,44.2923 (458.3 m/px)
-[air] map: HTTP 200, size 26610
-[air] map decoded in 419 ms, heap 158680
-[air] render total 28693 ms (panel 26024 ms)
+[air] vector map q=-1035..-130, 8463..8858 in 8495 ms, heap 84940
+[air] render total 37123 ms (panel 26023 ms)
 ```
 
-The background is stored as 400x240 at two bits per pixel (24 KB) and scaled to
-the 800x480 panel. JPEGDEC adds about 18 KB of heap; no PSRAM is required.
+The background is an 800x480 two-bit buffer (96 KB) with four inks. There is no
+map download and no JPEG decode, so no PSRAM is required.
 
 ## Limitations
 
@@ -369,9 +372,11 @@ the 800x480 panel. JPEGDEC adds about 18 KB of heap; no PSRAM is required.
   second API dependency and up to five HTTPS requests per wake; the RTC cache
   reduces repeat queries. Distance/bearing is always shown when no route is
   available.
-- Map mode adds one HTTPS request per wake for the Esri street-map export. If
-  the service is unavailable or rate-limits the device, the panel falls back to
-  the range-ring radar view. The map attribution is printed on the panel.
+- Map mode uses Natural Earth 1:50m vector data and draws only coastlines,
+  borders, rivers and major city names. It deliberately omits roads and raster
+  tile labels, so it is cleaner but less detailed than a street map. The 96 KB
+  map buffer is allocated after Wi-Fi is disconnected; if that fails the panel
+  shows `MAP DATA UNAVAILABLE`.
 - TLS certificate verification is disabled (`setInsecure()`) because the
   firmware does not ship a CA bundle. The feed is public and read-only, but a
   man-in-the-middle could alter the displayed data. The public image proxy

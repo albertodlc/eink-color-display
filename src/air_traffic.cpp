@@ -23,6 +23,9 @@
 #include "air_traffic_config.h"
 #include "fallback_photos.h"
 #include "flags.h"
+#if AIR_TRAFFIC_MODE == 6
+#include "vector_map.h"
+#endif
 
 namespace {
 
@@ -54,25 +57,25 @@ constexpr uint16_t kPhotoBytes = (kPhotoW * kPhotoH * 3 + 7) / 8 + 2;
 constexpr size_t kJpegBufferSize = 32 * 1024;
 
 #if AIR_TRAFFIC_MODE == 6
-// The street map is downloaded at 400x240 from the ArcGIS export and stored as
-// four inks (2 bits per pixel). It is scaled to 800x480 when drawn, so the
-// projection scale below refers to the display pixels.
-constexpr int16_t kMapImageW = 400;
-constexpr int16_t kMapImageH = 240;
-constexpr uint16_t kMapRowBytes = kMapImageW / 4;
-constexpr uint32_t kMapBytes = (uint32_t)kMapRowBytes * kMapImageH;
-constexpr size_t kMapJpegCapacity = 64 * 1024;
+// The map is rendered from Natural Earth 1:50m vectors into a 2-bit buffer at
+// the panel resolution. The buffer uses four inks: land, water, borders and
+// coastlines. There are no raster map tiles or tile-service labels.
 constexpr int16_t kMapDisplayW = epd::kWidth;
 constexpr int16_t kMapDisplayH = epd::kHeight;
 constexpr int16_t kMapCenterX = kMapDisplayW / 2;
 constexpr int16_t kMapCenterY = 256;
 constexpr int16_t kMapOffsetY = 16;
+constexpr uint16_t kMapRowBytes = kMapDisplayW / 4;
+constexpr uint32_t kMapBytes = (uint32_t)kMapRowBytes * kMapDisplayH;
+constexpr int16_t kMapQuantum = 200;  // 0.005 deg, matches the generator
 
 uint8_t* g_map_pixels = nullptr;
-uint8_t* g_map_jpeg = nullptr;
-size_t g_map_jpeg_size = 0;
-float g_map_m_per_px = 447.0f;
 bool g_map_ready = false;
+int32_t g_q_lon_min = 0;
+int32_t g_q_lon_max = 0;
+int32_t g_q_lat_min = 0;
+int32_t g_q_lat_max = 0;
+float g_map_m_per_px = 458.3f;
 #endif
 
 // Measured Spectra 6 appearance (Zephyr reTerminal E1002 reference panel).
@@ -876,155 +879,6 @@ bool download_photo(const char* url, uint8_t*& buffer, size_t capacity,
   }
   return true;
 }
-
-#if AIR_TRAFFIC_MODE == 6
-uint8_t map_index_from_rgb(uint8_t r, uint8_t g, uint8_t b) {
-  // OSM standard colours: light blue water, pale green parks, white land,
-  // dark/grey roads, borders and labels. Classify by hue and luminance rather
-  // than by Euclidean distance so the sea remains blue on the six-ink panel.
-  if (b > r + 25 && b >= g - 5) return 1;  // water -> blue
-  if (g > r + 10 && g > b + 5) return 2;   // parks -> green
-  const uint8_t mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
-  const uint8_t mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
-  const uint8_t luminance = (uint8_t)((r * 3 + g * 4 + b * 2) / 9);
-  if (luminance < 170 || (uint8_t)(mx - mn) > 70) return 3;  // roads/text
-  return 0;  // land
-}
-
-bool fetch_map_image(const AirTrafficConfig& config) {
-  if (g_map_jpeg) {
-    free(g_map_jpeg);
-    g_map_jpeg = nullptr;
-    g_map_jpeg_size = 0;
-  }
-
-  // A plate-carree export around the configured centre. The bbox is 10%
-  // larger than the configured radius and has the same 5:3 aspect as the
-  // panel, so the range circle fits below the header bar.
-  const float half_lat = (float)config.radius_km * 1.1f / 111.32f;
-  float cos_lat = cosf((float)config.lat * PI / 180.0f);
-  if (cos_lat < 0.05f) cos_lat = 0.05f;
-  const float half_lon =
-      half_lat * (float)kMapDisplayW / (float)kMapDisplayH / cos_lat;
-  g_map_m_per_px =
-      (2.0f * half_lat * 111320.0f) / (float)kMapDisplayH;
-
-  char url[384];
-  snprintf(url, sizeof(url),
-           "https://server.arcgisonline.com/ArcGIS/rest/services/"
-           "World_Street_Map/MapServer/export"
-           "?bbox=%.5f,%.5f,%.5f,%.5f&bboxSR=4326&imageSR=4326"
-           "&size=%d,%d&format=jpg&f=image",
-           config.lon - half_lon, config.lat - half_lat,
-           config.lon + half_lon, config.lat + half_lat,
-           (int)kMapImageW, (int)kMapImageH);
-
-  Serial.printf("[air] map bbox %.4f,%.4f - %.4f,%.4f (%.1f m/px)\n",
-                config.lon - half_lon, config.lat - half_lat,
-                config.lon + half_lon, config.lat + half_lat,
-                g_map_m_per_px);
-  Serial.flush();
-  if (!download_photo(url, g_map_jpeg, kMapJpegCapacity, g_map_jpeg_size,
-                      "map", nullptr, true)) {
-    Serial.println("[air] map image: download failed");
-    g_map_jpeg = nullptr;
-    return false;
-  }
-  Serial.printf("[air] map image: %u bytes\n", (unsigned)g_map_jpeg_size);
-  Serial.flush();
-  return true;
-}
-
-int jpeg_map_draw_callback(JPEGDRAW* draw) {
-  if (!g_map_pixels) return 1;
-  for (int yy = 0; yy < draw->iHeight; yy++) {
-    const int y = draw->y + yy;
-    if (y < 0 || y >= kMapImageH) continue;
-    for (int xx = 0; xx < draw->iWidthUsed; xx++) {
-      const int x = draw->x + xx;
-      if (x < 0 || x >= kMapImageW) continue;
-
-      const uint16_t rgb565 = draw->pPixels[yy * draw->iWidth + xx];
-      const uint8_t r5 = (uint8_t)((rgb565 >> 11) & 0x1F);
-      const uint8_t g6 = (uint8_t)((rgb565 >> 5) & 0x3F);
-      const uint8_t b5 = (uint8_t)(rgb565 & 0x1F);
-      const uint8_t r = (uint8_t)((r5 << 3) | (r5 >> 2));
-      const uint8_t g = (uint8_t)((g6 << 2) | (g6 >> 4));
-      const uint8_t b = (uint8_t)((b5 << 3) | (b5 >> 2));
-
-      const uint8_t index = map_index_from_rgb(r, g, b);
-      const size_t byte = (size_t)y * kMapRowBytes + (x >> 2);
-      const uint8_t shift = (uint8_t)((x & 3) * 2);
-      g_map_pixels[byte] =
-          (uint8_t)((g_map_pixels[byte] & ~(3u << shift)) | (index << shift));
-    }
-  }
-  return 1;
-}
-
-bool decode_map_image() {
-  if (!g_map_jpeg) return false;
-
-  Serial.printf("[air] map decode start: heap %u, largest %u\n",
-                (unsigned)ESP.getFreeHeap(),
-                (unsigned)ESP.getMaxAllocHeap());
-  if (!g_map_pixels) {
-    g_map_pixels = (uint8_t*)malloc(kMapBytes);
-    if (!g_map_pixels) {
-      Serial.printf("[air] map buffer: allocation failed, heap %u, largest %u\n",
-                    (unsigned)ESP.getFreeHeap(),
-                    (unsigned)ESP.getMaxAllocHeap());
-      free(g_map_jpeg);
-      g_map_jpeg = nullptr;
-      g_map_jpeg_size = 0;
-      return false;
-    }
-    memset(g_map_pixels, 0, kMapBytes);
-  }
-
-  Serial.printf("[air] map after buffer: heap %u, largest %u\n",
-                (unsigned)ESP.getFreeHeap(),
-                (unsigned)ESP.getMaxAllocHeap());
-  // The decoder is allocated on the heap: a static object overflowed the
-  // ESP32's DRAM segment. The pixel buffer is small enough to coexist.
-  JPEGDEC* decoder = new (std::nothrow) JPEGDEC();
-  if (!decoder) {
-    Serial.printf("[air] map decoder: allocation failed, heap %u, largest %u\n",
-                  (unsigned)ESP.getFreeHeap(),
-                  (unsigned)ESP.getMaxAllocHeap());
-    free(g_map_pixels);
-    g_map_pixels = nullptr;
-    free(g_map_jpeg);
-    g_map_jpeg = nullptr;
-    g_map_jpeg_size = 0;
-    return false;
-  }
-
-  const uint32_t started = millis();
-  const int opened = decoder->openRAM(g_map_jpeg, (int)g_map_jpeg_size,
-                                      jpeg_map_draw_callback);
-  const int decoded = opened ? decoder->decode(0, 0, 0) : 0;
-  delete decoder;
-
-  free(g_map_jpeg);
-  g_map_jpeg = nullptr;
-  g_map_jpeg_size = 0;
-
-  if (!decoded) {
-    Serial.printf("[air] map decode failed, heap %u\n",
-                  (unsigned)ESP.getFreeHeap());
-    free(g_map_pixels);
-    g_map_pixels = nullptr;
-    return false;
-  }
-  Serial.printf("[air] map decoded in %lu ms, heap %u\n",
-                (unsigned long)(millis() - started),
-                (unsigned)ESP.getFreeHeap());
-  Serial.flush();
-  g_map_ready = true;
-  return true;
-}
-#endif
 
 struct PhotoUrlCache {
   char registration[10];
@@ -2123,9 +1977,6 @@ bool fetch_traffic(AirTrafficData& data, const AirTrafficConfig& config) {
               return a.distance_km < b.distance_km;
             });
   data.ok = true;
-#if AIR_TRAFFIC_MODE == 6
-  fetch_map_image(config);
-#endif
 #if AIR_TRAFFIC_MODE != 6
   // Routes first while the heap is still roomy; photos need the large working
   // buffers and are fetched afterwards. Map mode needs neither.
@@ -2517,10 +2368,6 @@ void draw_empty_page(epd::Display& display, const AirTrafficData& data) {
 }
 
 #if AIR_TRAFFIC_MODE == 6
-constexpr int16_t kRadarCenterX = epd::kWidth / 2;
-constexpr int16_t kRadarCenterY = (kBodyTop + kBodyBottom) / 2;
-constexpr int16_t kRadarRadius = 195;
-
 void draw_plane_symbol(epd::Display& display, int16_t x, int16_t y,
                        int heading_deg, uint16_t color) {
   const float rad = heading_deg * PI / 180.0f;
@@ -2544,123 +2391,266 @@ void draw_plane_symbol(epd::Display& display, int16_t x, int16_t y,
   display.drawLine(tail_x, tail_y, wing2_x, wing2_y, color);
 }
 
-void draw_radar_map(epd::Display& display, const AirTrafficData& data,
-                    int16_t page_top, int16_t page_bottom) {
-  const int16_t cx = kRadarCenterX;
-  const int16_t cy = kRadarCenterY;
-  const int16_t radius = kRadarRadius;
-
-  // Range rings, crosshair and outer ticks.
-  if (intersects(cy - radius, cy + radius + 1, page_top, page_bottom)) {
-    display.drawCircle(cx, cy, radius, GxEPD_BLACK);
-    display.drawCircle(cx, cy, radius * 3 / 4, GxEPD_BLACK);
-    display.drawCircle(cx, cy, radius / 2, GxEPD_BLACK);
-    display.drawCircle(cx, cy, radius / 4, GxEPD_BLACK);
-    display.drawFastVLine(cx, cy - radius, radius * 2, GxEPD_BLACK);
-    display.drawFastHLine(cx - radius, cy, radius * 2, GxEPD_BLACK);
-  }
-
-  for (int16_t deg = 0; deg < 360; deg += 30) {
-    const float rad = deg * PI / 180.0f;
-    const int16_t x1 = cx + (int16_t)lroundf(sinf(rad) * radius);
-    const int16_t y1 = cy - (int16_t)lroundf(cosf(rad) * radius);
-    const int16_t x2 = cx + (int16_t)lroundf(sinf(rad) * (radius + 6));
-    const int16_t y2 = cy - (int16_t)lroundf(cosf(rad) * (radius + 6));
-    const int16_t top = y1 < y2 ? y1 : y2;
-    const int16_t bottom = y1 < y2 ? y2 : y1;
-    if (intersects(top, bottom + 1, page_top, page_bottom)) {
-      display.drawLine(x1, y1, x2, y2, GxEPD_BLACK);
-    }
-  }
-
-  const int16_t north_y = cy - radius - 18;
-  if (intersects(north_y, north_y + 16, page_top, page_bottom)) {
-    draw_centered(display, cx - 20, north_y, 40, "N", 2, GxEPD_BLACK);
-  }
-  const int16_t south_y = cy + radius + 4;
-  if (intersects(south_y, south_y + 16, page_top, page_bottom)) {
-    draw_centered(display, cx - 20, south_y, 40, "S", 2, GxEPD_BLACK);
-  }
-  const int16_t side_y = cy - 8;
-  if (intersects(side_y, side_y + 16, page_top, page_bottom)) {
-    draw_centered(display, cx + radius + 2, side_y, 30, "E", 2, GxEPD_BLACK);
-    draw_centered(display, cx - radius - 32, side_y, 30, "W", 2, GxEPD_BLACK);
-  }
-
-  // Home position at the centre of the configured radius.
-  if (intersects(cy - 8, cy + 12, page_top, page_bottom)) {
-    display.fillCircle(cx, cy, 4, GxEPD_BLUE);
-    display.drawCircle(cx, cy, 5, GxEPD_BLACK);
-    display.setTextSize(1);
-    display.setTextColor(GxEPD_BLACK);
-    display.setCursor(cx + 8, cy - 4);
-    display.print("HOME");
-  }
-
-  if (data.count == 0) {
-    if (intersects(cy + 24, cy + 40, page_top, page_bottom)) {
-      draw_centered(display, cx - 130, cy + 24, 260, "NO AIRCRAFT IN RANGE", 2,
-                    GxEPD_BLACK);
-    }
-  }
-
-  const float range_km = data.radius_km > 0 ? data.radius_km : 1.0f;
-  for (uint8_t i = 0; i < data.count; i++) {
-    const AirTrafficAircraft& aircraft = data.aircraft[i];
-    float distance = radius * (float)aircraft.distance_km / range_km;
-    if (distance < 0) distance = 0;
-    if (distance > radius) distance = radius;
-    const float rad = aircraft.bearing_deg * PI / 180.0f;
-    const int16_t x = cx + (int16_t)lroundf(sinf(rad) * distance);
-    const int16_t y = cy - (int16_t)lroundf(cosf(rad) * distance);
-
-    if (intersects(y - 6, y + 7, page_top, page_bottom)) {
-      display.fillCircle(x, y, 6, GxEPD_WHITE);
-      const int16_t heading =
-          aircraft.heading_deg >= 0 ? aircraft.heading_deg
-                                    : aircraft.bearing_deg;
-      draw_plane_symbol(display, x, y, heading, GxEPD_RED);
-    }
-
-    char label[12];
-    snprintf(label, sizeof(label), "%s", aircraft.callsign);
-    const int16_t label_w = text_width(label, 1);
-    int16_t label_x = x + 8;
-    if (label_x + label_w > cx + radius) label_x = x - 8 - label_w;
-    if (label_x < cx - radius) label_x = x + 8;
-    int16_t label_y = y - 4;
-    if (label_y < kBodyTop + 2) label_y = y + 8;
-    if (intersects(label_y, label_y + 8, page_top, page_bottom)) {
-      display.fillRect(label_x - 1, label_y - 1, label_w + 2, 10, GxEPD_WHITE);
-      display.setTextSize(1);
-      display.setTextColor(GxEPD_BLACK);
-      display.setCursor(label_x, label_y);
-      display.print(label);
-    }
-  }
-
-  if (intersects(kBodyBottom - 12, kBodyBottom, page_top, page_bottom)) {
-    char center_text[40];
-    snprintf(center_text, sizeof(center_text), "CENTRE %.4f, %.4f", data.lat,
-             data.lon);
-    display.setTextSize(1);
-    display.setTextColor(GxEPD_BLACK);
-    display.setCursor(18, kBodyBottom - 10);
-    display.print(center_text);
-
-    char range_text[24];
-    snprintf(range_text, sizeof(range_text), "RANGE %.0f KM", data.radius_km);
-    draw_right(display, epd::kWidth - 18, kBodyBottom - 10, range_text, 1,
-               GxEPD_BLACK);
-  }
-}
-
 const uint16_t kMapColors[4] = {GxEPD_WHITE, GxEPD_BLUE, GxEPD_GREEN,
                                 GxEPD_BLACK};
 
 uint8_t map_pixel(int16_t x, int16_t y) {
   const uint8_t packed = g_map_pixels[(size_t)y * kMapRowBytes + (x >> 2)];
   return (uint8_t)((packed >> ((x & 3) * 2)) & 3);
+}
+
+void map_set_pixel(int16_t x, int16_t y, uint8_t index) {
+  if (x < 0 || x >= kMapDisplayW || y < kMapOffsetY ||
+      y >= kMapDisplayH) {
+    return;
+  }
+  const size_t byte = (size_t)y * kMapRowBytes + (x >> 2);
+  const uint8_t shift = (uint8_t)((x & 3) * 2);
+  g_map_pixels[byte] =
+      (uint8_t)((g_map_pixels[byte] & ~(3u << shift)) | (index << shift));
+}
+
+void map_fill_span(int16_t y, int16_t x0, int16_t x1, uint8_t index) {
+  if (x0 > x1) {
+    const int16_t swap = x0;
+    x0 = x1;
+    x1 = swap;
+  }
+  if (x0 < 0) x0 = 0;
+  if (x1 >= kMapDisplayW) x1 = kMapDisplayW - 1;
+  for (int16_t x = x0; x <= x1; x++) {
+    map_set_pixel(x, y, index);
+  }
+}
+
+int32_t line_outcode(int32_t x, int32_t y, int32_t xmin, int32_t ymin,
+                     int32_t xmax, int32_t ymax) {
+  int32_t code = 0;
+  if (x < xmin) code |= 1;
+  else if (x > xmax) code |= 2;
+  if (y < ymin) code |= 4;
+  else if (y > ymax) code |= 8;
+  return code;
+}
+
+// Cohen-Sutherland clipping. Map vectors can extend far outside the visible
+// rectangle, and clipping keeps Bresenham loops short.
+bool clip_line(int32_t& x0, int32_t& y0, int32_t& x1, int32_t& y1,
+               int32_t xmin, int32_t ymin, int32_t xmax, int32_t ymax) {
+  int32_t code0 = line_outcode(x0, y0, xmin, ymin, xmax, ymax);
+  int32_t code1 = line_outcode(x1, y1, xmin, ymin, xmax, ymax);
+  for (;;) {
+    if (!(code0 | code1)) return true;
+    if (code0 & code1) return false;
+
+    const int32_t code = code0 ? code0 : code1;
+    int32_t x = 0;
+    int32_t y = 0;
+    if (code & 8) {
+      x = x0 + (x1 - x0) * (ymax - y0) / (y1 - y0);
+      y = ymax;
+    } else if (code & 4) {
+      x = x0 + (x1 - x0) * (ymin - y0) / (y1 - y0);
+      y = ymin;
+    } else if (code & 2) {
+      y = y0 + (y1 - y0) * (xmax - x0) / (x1 - x0);
+      x = xmax;
+    } else {
+      y = y0 + (y1 - y0) * (xmin - x0) / (x1 - x0);
+      x = xmin;
+    }
+
+    if (code == code0) {
+      x0 = x;
+      y0 = y;
+      code0 = line_outcode(x0, y0, xmin, ymin, xmax, ymax);
+    } else {
+      x1 = x;
+      y1 = y;
+      code1 = line_outcode(x1, y1, xmin, ymin, xmax, ymax);
+    }
+  }
+}
+
+void map_draw_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
+                   uint8_t index) {
+  const int16_t dx = (int16_t)abs(x1 - x0);
+  const int16_t sx = x0 < x1 ? 1 : -1;
+  const int16_t dy = (int16_t)-abs(y1 - y0);
+  const int16_t sy = y0 < y1 ? 1 : -1;
+  int16_t err = (int16_t)(dx + dy);
+  for (;;) {
+    map_set_pixel(x0, y0, index);
+    if (x0 == x1 && y0 == y1) break;
+    const int16_t e2 = (int16_t)(2 * err);
+    if (e2 >= dy) {
+      err = (int16_t)(err + dy);
+      x0 = (int16_t)(x0 + sx);
+    }
+    if (e2 <= dx) {
+      err = (int16_t)(err + dx);
+      y0 = (int16_t)(y0 + sy);
+    }
+  }
+}
+
+int32_t map_project_x(int16_t q_lon) {
+  return (int32_t)(q_lon - g_q_lon_min) * kMapDisplayW /
+         (g_q_lon_max - g_q_lon_min);
+}
+
+int32_t map_project_y(int16_t q_lat) {
+  return kMapOffsetY + (int32_t)(g_q_lat_max - q_lat) * kMapDisplayH /
+                           (g_q_lat_max - g_q_lat_min);
+}
+
+bool polyline_visible(const MapPolyline& line) {
+  return line.max_lon >= g_q_lon_min && line.min_lon <= g_q_lon_max &&
+         line.max_lat >= g_q_lat_min && line.min_lat <= g_q_lat_max;
+}
+
+void draw_polyline_table(const MapPolyline* table, uint16_t count,
+                         uint8_t color) {
+  for (uint16_t i = 0; i < count; i++) {
+    const MapPolyline& line = table[i];
+    if (!polyline_visible(line)) continue;
+    const int16_t* points = &kVectorMapPoints[line.offset * 2];
+    int32_t previous_x = map_project_x(points[0]);
+    int32_t previous_y = map_project_y(points[1]);
+    for (uint16_t j = 1; j < line.count; j++) {
+      int32_t x = map_project_x(points[j * 2]);
+      int32_t y = map_project_y(points[j * 2 + 1]);
+      int32_t x0 = previous_x;
+      int32_t y0 = previous_y;
+      int32_t x1 = x;
+      int32_t y1 = y;
+      if (clip_line(x0, y0, x1, y1, 0, kMapOffsetY, kMapDisplayW - 1,
+                    kMapDisplayH - 1)) {
+        map_draw_line((int16_t)x0, (int16_t)y0, (int16_t)x1, (int16_t)y1,
+                      color);
+      }
+      previous_x = x;
+      previous_y = y;
+    }
+  }
+}
+
+void fill_ocean() {
+  const int32_t lon_span = g_q_lon_max - g_q_lon_min;
+  const int32_t lat_span = g_q_lat_max - g_q_lat_min;
+  if (lon_span <= 0 || lat_span <= 0) return;
+
+  for (int16_t y = kMapOffsetY; y < kMapDisplayH; y++) {
+    const float q_lat =
+        (float)g_q_lat_max -
+        ((float)(y - kMapOffsetY) + 0.5f) * (float)lat_span / kMapDisplayH;
+    int32_t intersections[512];
+    uint16_t found = 0;
+
+    for (uint16_t r = 0; r < kOceanRingCount; r++) {
+      const MapPolyline& ring = kOceanRings[r];
+      if (ring.max_lat < q_lat || ring.min_lat > q_lat) continue;
+      if (ring.max_lon < g_q_lon_min || ring.min_lon > g_q_lon_max) continue;
+
+      const int16_t* points = &kVectorMapPoints[ring.offset * 2];
+      for (uint16_t i = 0; i < ring.count; i++) {
+        const uint16_t next = (uint16_t)((i + 1) % ring.count);
+        const int16_t lon1 = points[i * 2];
+        const int16_t lat1 = points[i * 2 + 1];
+        const int16_t lon2 = points[next * 2];
+        const int16_t lat2 = points[next * 2 + 1];
+        if ((lat1 <= q_lat && lat2 > q_lat) ||
+            (lat2 <= q_lat && lat1 > q_lat)) {
+          const float t = (q_lat - (float)lat1) / (float)(lat2 - lat1);
+          const float lon = (float)lon1 + t * (float)(lon2 - lon1);
+          const int32_t x =
+              (int32_t)lroundf((lon - (float)g_q_lon_min) *
+                               (float)kMapDisplayW / (float)lon_span);
+          if (found < 512) intersections[found++] = x;
+        }
+      }
+    }
+
+    if (found < 2) continue;
+    std::sort(intersections, intersections + found);
+    for (uint16_t i = 0; i + 1 < found; i += 2) {
+      int32_t left = intersections[i];
+      int32_t right = intersections[i + 1];
+      if (left < -1) left = -1;
+      if (left > kMapDisplayW) left = kMapDisplayW;
+      if (right < -1) right = -1;
+      if (right > kMapDisplayW) right = kMapDisplayW;
+      map_fill_span(y, (int16_t)left, (int16_t)right, 1);
+    }
+  }
+}
+
+void draw_map_places() {
+  for (uint16_t i = 0; i < kMapPlaceCount; i++) {
+    const MapPlace& place = kMapPlaces[i];
+    if (place.rank > 5) continue;
+    if (place.lon < g_q_lon_min || place.lon > g_q_lon_max ||
+        place.lat < g_q_lat_min || place.lat > g_q_lat_max) {
+      continue;
+    }
+    const int32_t x = map_project_x(place.lon);
+    const int32_t y = map_project_y(place.lat);
+    if (x < 2 || x >= kMapDisplayW - 2 || y < kMapOffsetY + 2 ||
+        y >= kMapDisplayH - 2) {
+      continue;
+    }
+    map_fill_span((int16_t)y, (int16_t)(x - 1), (int16_t)(x + 1), 3);
+    map_fill_span((int16_t)(y - 1), (int16_t)(x - 1),
+                  (int16_t)(x + 1), 3);
+    map_fill_span((int16_t)(y + 1), (int16_t)(x - 1),
+                  (int16_t)(x + 1), 3);
+  }
+}
+
+bool prepare_vector_map(const AirTrafficData& data) {
+  if (g_map_ready && g_map_pixels) return true;
+
+  const float half_lat = data.radius_km * 1.1f / 111.32f;
+  float cos_lat = cosf((float)data.lat * PI / 180.0f);
+  if (cos_lat < 0.05f) cos_lat = 0.05f;
+  const float half_lon =
+      half_lat * (float)kMapDisplayW / (float)kMapDisplayH / cos_lat;
+
+  g_q_lon_min =
+      (int32_t)lroundf(((float)data.lon - half_lon) * kMapQuantum);
+  g_q_lon_max =
+      (int32_t)lroundf(((float)data.lon + half_lon) * kMapQuantum);
+  g_q_lat_min =
+      (int32_t)lroundf(((float)data.lat - half_lat) * kMapQuantum);
+  g_q_lat_max =
+      (int32_t)lroundf(((float)data.lat + half_lat) * kMapQuantum);
+  if (g_q_lon_max <= g_q_lon_min || g_q_lat_max <= g_q_lat_min) return false;
+  g_map_m_per_px = 2.0f * half_lat * 111320.0f / (float)kMapDisplayH;
+
+  if (!g_map_pixels) {
+    g_map_pixels = (uint8_t*)malloc(kMapBytes);
+  }
+  if (!g_map_pixels) {
+    Serial.printf("[air] map buffer: allocation failed, heap %u, largest %u\n",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getMaxAllocHeap());
+    return false;
+  }
+
+  memset(g_map_pixels, 0, kMapBytes);
+  const uint32_t started = millis();
+  fill_ocean();
+  draw_polyline_table(kOceanRings, kOceanRingCount, 3);
+  draw_polyline_table(kBorderLines, kBorderLineCount, 2);
+  draw_polyline_table(kRiverLines, kRiverLineCount, 1);
+  draw_map_places();
+  g_map_ready = true;
+  Serial.printf("[air] vector map q=%ld..%ld, %ld..%ld in %lu ms, heap %u\n",
+                (long)g_q_lon_min, (long)g_q_lon_max, (long)g_q_lat_min,
+                (long)g_q_lat_max, (unsigned long)(millis() - started),
+                (unsigned)ESP.getFreeHeap());
+  Serial.flush();
+  return true;
 }
 
 void draw_map_label(epd::Display& display, int16_t x, int16_t y,
@@ -2675,29 +2665,40 @@ void draw_map_label(epd::Display& display, int16_t x, int16_t y,
 
 void draw_real_map_background(epd::Display& display, int16_t page_top,
                               int16_t page_bottom) {
-  int16_t first = page_top < kMapOffsetY ? kMapOffsetY : page_top;
-  int16_t last = page_bottom > kMapDisplayH ? kMapDisplayH : page_bottom;
+  const int16_t first = page_top < kMapOffsetY ? kMapOffsetY : page_top;
+  const int16_t last =
+      page_bottom > kMapDisplayH ? kMapDisplayH : page_bottom;
   for (int16_t y = first; y < last; y++) {
-    const int16_t sy =
-        (int16_t)(((int32_t)(y - kMapOffsetY) * kMapImageH) / kMapDisplayH);
-    if (sy < 0 || sy >= kMapImageH) continue;
-
     int16_t x = 0;
     while (x < kMapDisplayW) {
-      const int16_t sx =
-          (int16_t)(((int32_t)x * kMapImageW) / kMapDisplayW);
-      const uint8_t index = map_pixel(sx, sy);
+      const uint8_t index = map_pixel(x, y);
       int16_t run = 1;
-      while (x + run < kMapDisplayW) {
-        const int16_t next_sx =
-            (int16_t)(((int32_t)(x + run) * kMapImageW) / kMapDisplayW);
-        if (map_pixel(next_sx, sy) != index) break;
+      while (x + run < kMapDisplayW &&
+             map_pixel((int16_t)(x + run), y) == index) {
         run++;
       }
       display.drawFastHLine(x, y, run, kMapColors[index]);
       x = (int16_t)(x + run);
     }
   }
+}
+
+struct MapLabelRect {
+  int16_t x;
+  int16_t y;
+  int16_t w;
+  int16_t h;
+};
+
+bool label_overlaps(const MapLabelRect* used, uint8_t count, int16_t x,
+                    int16_t y, int16_t w, int16_t h) {
+  for (uint8_t i = 0; i < count; i++) {
+    if (x < used[i].x + used[i].w && used[i].x < x + w &&
+        y < used[i].y + used[i].h && used[i].y < y + h) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
@@ -2711,16 +2712,36 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
     display.fillCircle(cx, cy, 5, GxEPD_WHITE);
     display.drawCircle(cx, cy, 6, GxEPD_BLACK);
     display.fillCircle(cx, cy, 3, GxEPD_RED);
-    draw_map_label(display, cx + 9, cy - 4, "HOME", 1);
   }
 
-  // Keep north visible below the header bar.
   draw_map_label(display, cx - 6, 36, "N", 2);
 
-  if (data.count == 0 && intersects(cy + 28, cy + 48, page_top,
-                                    page_bottom)) {
-    const char* text = "NO AIRCRAFT IN RANGE";
-    draw_map_label(display, cx - text_width(text, 2) / 2, cy + 28, text, 2);
+  // A small set of city names from Natural Earth, never labels from a raster
+  // tile service. Skip labels that would overlap an earlier one.
+  MapLabelRect used[16];
+  uint8_t used_count = 0;
+  for (uint16_t i = 0; i < kMapPlaceCount && used_count < 8; i++) {
+    const MapPlace& place = kMapPlaces[i];
+    if (place.rank > 5) continue;
+    if (place.lon < g_q_lon_min || place.lon > g_q_lon_max ||
+        place.lat < g_q_lat_min || place.lat > g_q_lat_max) {
+      continue;
+    }
+    int16_t x = (int16_t)map_project_x(place.lon);
+    int16_t y = (int16_t)map_project_y(place.lat);
+    if (x < 8 || x > kMapDisplayW - 8 || y < 38 || y > 458) continue;
+    const int16_t width = text_width(place.name, 1);
+    int16_t label_x = x + 4;
+    if (label_x + width > kMapDisplayW - 6) label_x = x - 4 - width;
+    const int16_t label_y = y - 4;
+    if (label_overlaps(used, used_count, label_x - 1, label_y - 1,
+                       width + 2, 10)) {
+      continue;
+    }
+    if (intersects(label_y, label_y + 8, page_top, page_bottom)) {
+      draw_map_label(display, label_x, label_y, place.name, 1);
+    }
+    used[used_count++] = {label_x - 1, label_y - 1, (int16_t)(width + 2), 10};
   }
 
   for (uint8_t i = 0; i < data.count; i++) {
@@ -2746,50 +2767,47 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
     char label[12];
     snprintf(label, sizeof(label), "%s", aircraft.callsign);
     const int16_t label_w = text_width(label, 1);
-    int16_t label_x = x + 8;
-    if (label_x + label_w > kMapDisplayW - 6) label_x = x - 8 - label_w;
-    if (label_x < 6) label_x = x + 8;
-    int16_t label_y = y - 4;
-    if (label_y < 36) label_y = y + 8;
-    if (intersects(label_y, label_y + 8, page_top, page_bottom)) {
-      draw_map_label(display, label_x, label_y, label, 1);
+    const int16_t candidate_x[4] = {x + 8, (int16_t)(x - 8 - label_w),
+                                    (int16_t)(x - label_w / 2),
+                                    (int16_t)(x - label_w / 2)};
+    const int16_t candidate_y[4] = {y - 4, y - 4, y - 14, y + 8};
+    for (uint8_t candidate = 0; candidate < 4; candidate++) {
+      const int16_t label_x = candidate_x[candidate];
+      const int16_t label_y = candidate_y[candidate];
+      if (label_x < 6 || label_x + label_w > kMapDisplayW - 6 ||
+          label_y < 36 || label_y > 466) {
+        continue;
+      }
+      if (label_overlaps(used, used_count, label_x - 1, label_y - 1,
+                         label_w + 2, 10)) {
+        continue;
+      }
+      if (intersects(label_y, label_y + 8, page_top, page_bottom)) {
+        draw_map_label(display, label_x, label_y, label, 1);
+      }
+      if (used_count < 16) {
+        used[used_count++] = {label_x - 1, label_y - 1,
+                              (int16_t)(label_w + 2), 10};
+      }
+      break;
     }
   }
 
-  char center_text[40];
-  snprintf(center_text, sizeof(center_text), "CENTRE %.4f, %.4f", data.lat,
-           data.lon);
-  if (intersects(36, 46, page_top, page_bottom)) {
-    draw_map_label(display, 18, 36, center_text, 1);
-  }
-
   if (intersects(460, 472, page_top, page_bottom)) {
-    draw_map_label(display, 18, 462, "(c) Esri, HERE, Garmin, OSM", 1);
-    char range_text[24];
-    snprintf(range_text, sizeof(range_text), "RANGE %.0f KM", data.radius_km);
-    draw_map_label(display,
-                   epd::kWidth - 18 - text_width(range_text, 1), 462,
-                   range_text, 1);
+    draw_map_label(display, 18, 462, "(c) Natural Earth", 1);
   }
 }
 
 void draw_map_page(epd::Display& display, const AirTrafficData& data,
                    int16_t page_top, int16_t page_bottom) {
   if (!g_map_ready || !g_map_pixels) {
-    draw_radar_map(display, data, page_top, page_bottom);
+    if (intersects(200, 240, page_top, page_bottom)) {
+      draw_centered(display, 0, 210, epd::kWidth, "MAP DATA UNAVAILABLE", 2,
+                    GxEPD_BLACK);
+    }
     return;
   }
-
   draw_real_map_background(display, page_top, page_bottom);
-
-  const float radius_f = data.radius_km * 1000.0f / g_map_m_per_px;
-  const int16_t range_radius = (int16_t)lroundf(radius_f);
-  if (range_radius > 8 && range_radius < 300 &&
-      intersects(kMapCenterY - range_radius, kMapCenterY + range_radius + 1,
-                 page_top, page_bottom)) {
-    display.drawCircle(kMapCenterX, kMapCenterY, range_radius, GxEPD_BLACK);
-  }
-
   draw_real_map_overlay(display, data, page_top, page_bottom);
 }
 #endif
@@ -2850,6 +2868,7 @@ void render_traffic(epd::Display& display, const AirTrafficData& data) {
                   aircraft.callsign, aircraft.distance_km,
                   aircraft.bearing_deg, aircraft.heading_deg);
   }
+  prepare_vector_map(data);
   Serial.flush();
 #endif
   display.firstPage();
@@ -2999,9 +3018,6 @@ void airTrafficRun(epd::Display& display) {
   WiFi.disconnect(true);
   Serial.printf("[air] free heap %u bytes\n", (unsigned)ESP.getFreeHeap());
   Serial.flush();
-#if AIR_TRAFFIC_MODE == 6
-  if (fetched) decode_map_image();
-#endif
   if (fetched) {
     const uint32_t start = millis();
     render_traffic(display, data);
