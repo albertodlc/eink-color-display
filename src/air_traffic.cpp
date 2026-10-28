@@ -147,13 +147,17 @@ RTC_DATA_ATTR uint8_t g_cycle_index = 0;
 
 void init_view_mode() {
 #if AIR_TRAFFIC_CYCLE_MODES
-  if (g_cycle_magic != kCycleMagic || g_cycle_index >= kCycleModeCount) {
+  if (g_cycle_magic != kCycleMagic || g_cycle_index > kCycleModeCount) {
     g_cycle_index = 0;
     g_cycle_magic = kCycleMagic;
+  } else if (g_cycle_index >= kCycleModeCount) {
+    g_cycle_index = 0;  // finished the sequence: return to the initial view
   } else {
-    g_cycle_index = (uint8_t)((g_cycle_index + 1) % kCycleModeCount);
+    g_cycle_index++;
   }
-  g_mode = kCycleModes[g_cycle_index];
+  g_mode = g_cycle_index == 0
+               ? AIR_TRAFFIC_CYCLE_INITIAL_MODE
+               : kCycleModes[g_cycle_index - 1];
 #else
   g_mode = AIR_TRAFFIC_MODE;
 #endif
@@ -731,6 +735,7 @@ void photo_clear(PhotoCard& photo) {
 }
 
 PhotoCard* g_active_photo = nullptr;
+JPEGDEC* g_photo_decoder = nullptr;
 uint8_t* g_decode_rgb = nullptr;
 uint8_t* g_feature_photo = nullptr;  // RGB332 320x128 for the large single view
 bool g_feature_valid = false;
@@ -801,17 +806,15 @@ bool process_photo(const uint8_t* jpeg_bytes, size_t jpeg_size,
   Serial.printf("[air] jpeg: %u bytes, %02X %02X\n", (unsigned)jpeg_size,
                 jpeg_bytes[0], jpeg_bytes[1]);
 
-  JPEGDEC* decoder = new JPEGDEC();
+  JPEGDEC* decoder = g_photo_decoder;
   if (!decoder) return false;
   uint8_t* data = const_cast<uint8_t*>(jpeg_bytes);
   if (!decoder->openRAM(data, (int)jpeg_size, jpeg_draw_callback)) {
     Serial.println("[air] jpeg: open failed");
-    delete decoder;
     return false;
   }
   if (decoder->getJPEGType() == JPEG_MODE_PROGRESSIVE) {
     Serial.println("[air] jpeg: progressive");
-    delete decoder;
     return false;
   }
 
@@ -854,7 +857,6 @@ bool process_photo(const uint8_t* jpeg_bytes, size_t jpeg_size,
   const int ok = decoder->decode(0, 0, 0);
   g_active_photo = nullptr;
   g_decode_rgb = nullptr;
-  delete decoder;
   if (!ok) {
     Serial.println("[air] jpeg: decode failed");
     return false;
@@ -1281,6 +1283,14 @@ void fetch_photos(AirTrafficData& data) {
   }
   Serial.printf("[air] photo buffers: heap %u\n",
                 (unsigned)ESP.getFreeHeap());
+  if (!g_photo_decoder) {
+    g_photo_decoder = new (std::nothrow) JPEGDEC();
+  }
+  if (!g_photo_decoder) {
+    Serial.printf("[air] photo decoder: allocation failed, heap %u\n",
+                  (unsigned)ESP.getFreeHeap());
+    return;
+  }
   for (uint8_t i = 0; i < g_active_cards; i++) {
     if (g_photos[i]) g_photos[i]->valid = false;
   }
@@ -1321,6 +1331,8 @@ void fetch_photos(AirTrafficData& data) {
                   (unsigned long)(millis() - start));
     Serial.flush();
   }
+  delete g_photo_decoder;
+  g_photo_decoder = nullptr;
 }
 
 void format_time_date(uint32_t epoch, char* time_out, size_t time_size,

@@ -207,7 +207,8 @@ Compile-time defaults live in `include/air_traffic_config.h`:
 | `AIR_TRAFFIC_PAGE_AIRCRAFT` | 5 | Maximum cards any mode can draw |
 | `AIR_TRAFFIC_MODE` | 0 | Initial/fallback view: 0 auto, 1 demo, 2 one, 3 two, 4 three, 5 five, 6 map |
 | `AIR_TRAFFIC_CYCLE_MODES` | 1 | Cycle the view after every refresh |
-| `AIR_TRAFFIC_CYCLE_SEQUENCE` | `2,6,3,4,5,0` | View order when cycling |
+| `AIR_TRAFFIC_CYCLE_INITIAL_MODE` | 0 | View shown on power-on and after the sequence |
+| `AIR_TRAFFIC_CYCLE_SEQUENCE` | `2,6,3,4,5` | View order when cycling |
 | `AIR_TRAFFIC_DEMO` | derived | 1 only when `AIR_TRAFFIC_MODE=1` |
 | `AIR_TRAFFIC_DEMO_COUNT` | 4 | Demo aircraft: 1-5 |
 
@@ -217,8 +218,9 @@ validated before they are saved.
 ### Display modes
 
 `AIR_TRAFFIC_MODE` selects the initial/fallback poster composition. By default
-the firmware also cycles the view after every refresh using
-`AIR_TRAFFIC_CYCLE_SEQUENCE` (`2,6,3,4,5,0`):
+the firmware starts at `AIR_TRAFFIC_CYCLE_INITIAL_MODE` (0, auto/2×2), then
+cycles the view after every refresh using `AIR_TRAFFIC_CYCLE_SEQUENCE`
+(`2,6,3,4,5`). After the last entry it returns to the initial mode and repeats:
 
 | Mode | Aircraft | Layout |
 | --- | --- | --- |
@@ -231,11 +233,11 @@ the firmware also cycles the view after every refresh using
 | `6` | live, up to 40 | vector map with aircraft markers |
 
 ```bash
-# Default: cycle through 2,6,3,4,5,0
+# Default: 0 -> 2 -> 6 -> 3 -> 4 -> 5 -> 0 -> ...
 pio run -t upload
 
-# Custom cycle, including demo
-PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_CYCLE_SEQUENCE=2,6,1,3,0" \
+# Start on the single-aircraft view and include demo
+PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_CYCLE_INITIAL_MODE=2 -DAIR_TRAFFIC_CYCLE_SEQUENCE=6,1,3,4,5" \
   pio run -t upload
 
 # Fixed view
@@ -243,9 +245,10 @@ PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_CYCLE_MODES=0 -DAIR_TRAFFIC_MODE=6" \
   pio run -t upload
 ```
 
-The cycle index survives deep sleep but restarts at the first sequence entry
-after a power-on reset. Demo mode is excluded from the default sequence because
-it uses the built-in sample aircraft; add `1` if you want it in the rotation.
+The cycle index survives deep sleep. After the last sequence entry it loops
+back to `AIR_TRAFFIC_CYCLE_INITIAL_MODE`; a power-on reset also starts there.
+Demo mode is excluded from the default sequence because it uses the built-in
+sample aircraft; add `1` if you want it in the rotation.
 When demo is in the cycle it deep-sleeps like the other views; a fixed demo
 build stays awake for layout testing. `AIR_TRAFFIC_DEMO` is derived from mode 1,
 and the legacy `-DAIR_TRAFFIC_DEMO=1` flag is accepted as an alias for mode 1.

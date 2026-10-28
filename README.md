@@ -151,15 +151,17 @@ data source, portal, layout and limitations.
 | `5` | Five live aircraft (3 on top, 2 centred below) |
 | `6` | Vector map centred on the configured location and radius |
 
-By default the display cycles through `2, 6, 3, 4, 5, 0` after every refresh.
-Override the sequence with:
+By default the display starts at the initial mode (`0`, auto/2×2), then cycles
+through `2, 6, 3, 4, 5`; after the last view it returns to the initial mode and
+repeats. Override the sequence with:
 
 ```bash
-PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_CYCLE_SEQUENCE=2,6,3,4,5,0" \
+PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_CYCLE_SEQUENCE=2,6,3,4,5" \
   pio run -t upload
 ```
 
-Include demo mode with `1` in the sequence. Disable cycling with
+The start view is `AIR_TRAFFIC_CYCLE_INITIAL_MODE` (defaults to
+`AIR_TRAFFIC_MODE`). Include demo mode with `1` in the sequence. Disable cycling with
 `-DAIR_TRAFFIC_CYCLE_MODES=0`; `AIR_TRAFFIC_MODE` then selects one fixed view:
 
 ```bash

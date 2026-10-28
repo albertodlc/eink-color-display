@@ -28,14 +28,23 @@
 #  error "AIR_TRAFFIC_MODE must be 0 (auto), 1 (demo), 2 (one), 3 (two), 4 (three), 5 (five) or 6 (map)"
 #endif
 
-// Cycle the displayed view after every refresh. The sequence can be overridden
-// with -DAIR_TRAFFIC_CYCLE_SEQUENCE=2,6,3,4,5,0. Mode 1 is the demo feed and
-// is intentionally not in the default sequence.
+// Cycle the displayed view after every refresh. The initial mode is shown on
+// power-on, then the sequence runs; after the last sequence entry the display
+// returns to the initial mode and repeats. Override the sequence with
+// -DAIR_TRAFFIC_CYCLE_SEQUENCE=2,6,3,4,5 and the start view with
+// -DAIR_TRAFFIC_CYCLE_INITIAL_MODE=0. Mode 1 is the demo feed and is not in the
+// default sequence.
 #ifndef AIR_TRAFFIC_CYCLE_MODES
 #  define AIR_TRAFFIC_CYCLE_MODES 1
 #endif
+#ifndef AIR_TRAFFIC_CYCLE_INITIAL_MODE
+#  define AIR_TRAFFIC_CYCLE_INITIAL_MODE AIR_TRAFFIC_MODE
+#endif
 #ifndef AIR_TRAFFIC_CYCLE_SEQUENCE
-#  define AIR_TRAFFIC_CYCLE_SEQUENCE 2, 6, 3, 4, 5, 0
+#  define AIR_TRAFFIC_CYCLE_SEQUENCE 2, 6, 3, 4, 5
+#endif
+#if AIR_TRAFFIC_CYCLE_INITIAL_MODE < 0 || AIR_TRAFFIC_CYCLE_INITIAL_MODE > 6
+#  error "AIR_TRAFFIC_CYCLE_INITIAL_MODE must be 0..6"
 #endif
 #if AIR_TRAFFIC_CYCLE_MODES
 #  define AIR_TRAFFIC_ALL_MODES 1
