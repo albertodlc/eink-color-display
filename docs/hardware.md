@@ -69,8 +69,50 @@ sends power-off while the panel is still refreshing.
 
 `include/epd_config.h` derives a small driver subclass with a **45 s** busy
 timeout. This keeps the driver waiting until BUSY is released and makes the
-power-off sequence safe. The serial log should show a refresh around 26 s and no
-`Busy Timeout!` message.
+power-off sequence safe.
+
+The firmware boots into the air-traffic page and performs a single full refresh.
+The subclass records the BUSY wait, and the serial log separates transfer and
+panel time:
+
+```text
+[air] render total 27540 ms (panel 26008 ms)
+```
+
+The log should show a panel time around 26 s and no `Busy Timeout!` message.
+The transfer part covers the 192 KB SPI transfer; drawing is Adafruit GFX
+rendering of only the current page's 160-row band. The panel time is temperature
+compensated, so a cold panel is slower; the 15-22 s datasheet figure is at about
+25 °C.
+
+### Rotation
+
+`include/epd_config.h` sets `EPD_ROTATE_180` to **1** by default, which rotates
+the complete screen (text and images) for an upside-down panel mounting. The
+paged renderer reverses the logical page order so the page buffer still maps to
+the physical panel. Build with `-DEPD_ROTATE_180=0` for the normal orientation.
+
+### Init variants
+
+Good Display's ESP32 sample (`docs/ESP32-GDEP073E01.zip`) also contains
+`EPD_init_fast()`, which changes the PLL, booster and VCOM registers. On this
+unit it measured **30.5 s** panel BUSY versus **26.2 s** for GxEPD2's stock init,
+so the project keeps the stock sequence. The alternate sequence is available
+behind `-DEPD_FAST_INIT=1` in `src/main.cpp` / `include/epd_config.h` for
+experiments. It is a useful reminder that the "fast" label does not guarantee a
+faster waveform on every panel revision.
+
+## Controller and OTP
+
+The module is sold as **ED2208-GCA**, but `REV` (`0x70`) reports **Solomon
+Systech SPD1657A** (`01 01 04`). The 44-page controller manual is
+[SPD1657A-1.0.pdf](SPD1657A-1.0.pdf). There is no public controller firmware
+image or SDK: the 96 KB OTP contains the waveform table, not executable code,
+and is factory-programmed (`PGM 0x90`/`APG 0x91` need VPP 7.5 V). PSR B[7]
+`LUT_EN=0` auto-loads the OTP LUT; `LUT_EN=1` expects an MCU LUT. The shared SDI
+line is bidirectional, so the ESP32 can read `REV`/`FLG`/`ROTP`; see
+[otp-readback.md](otp-readback.md) for the read commands, the extraction results
+and the GitHub/repo sweep.
 
 ## Notes
 
