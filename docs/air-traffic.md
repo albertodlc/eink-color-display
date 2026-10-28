@@ -21,10 +21,11 @@ bundled side-view fallback photos otherwise.
 4. Request the adsb.lol point feed for the configured latitude, longitude and
    radius.
 5. Parse the JSON, keep the nearest `AIR_TRAFFIC_MAX_AIRCRAFT` aircraft and
-   show the nearest `AIR_TRAFFIC_PAGE_AIRCRAFT` on the poster.
-6. Optionally resolve routes from adsbdb for the four displayed aircraft
+   show the nearest `AIR_TRAFFIC_ACTIVE_CARDS` selected by `AIR_TRAFFIC_MODE`.
+6. Optionally resolve routes from adsbdb for the displayed aircraft
    (RTC-cached for two hours); missing routes fall back to distance/bearing.
-7. Draw the poster, hibernate the panel, then deep-sleep for
+   Map mode skips this and the photo lookup.
+7. Draw the poster or map, hibernate the panel, then deep-sleep for
    `AIR_TRAFFIC_UPDATE_S` seconds.
 
 Press **RESET** at any time for an immediate update.
@@ -81,7 +82,7 @@ https://api.adsb.lol/v2/lat/{lat}/lon/{lon}/dist/{nm}
 Only the fields used by the page are materialised:
 
 ```text
-now, ac[].hex, flight, t, alt_baro, baro_rate, lat, lon, dst, dir
+now, ac[].hex, flight, t, alt_baro, baro_rate, lat, lon, dst, dir, track
 ```
 
 The reader parses one aircraft object at a time and keeps only the nearest
@@ -94,15 +95,17 @@ on an ESP32 without PSRAM.
 https://api.adsbdb.com/v0/callsign/{callsign}
 ```
 
-- Only the four aircraft that fit on the poster are looked up, and only when the
-  callsign contains a digit (a plausible flight number).
+- Only the aircraft displayed by the selected mode are looked up (at most
+  five), and only when the callsign contains a digit (a plausible flight
+  number). Map mode skips route lookups and photos entirely.
 - The response's `origin.municipality` and `destination.municipality` become
   `Dublin to Milan`; empty names fall back to the IATA codes.
 - A 3.5 s timeout per request. Failures or unknown callsigns leave the route
   empty and the card shows distance/bearing instead.
-- Up to four requests per wake. A 12-entry cache in RTC memory keeps successful
-  and failed lookups for two hours; it survives deep sleep but not a power
-  cycle. This avoids hammering adsbdb for the same flight every five minutes.
+- One request per displayed aircraft (up to five per wake). A 12-entry cache
+  in RTC memory keeps successful and failed lookups for two hours; it survives
+  deep sleep but not a power cycle. This avoids hammering adsbdb for the same
+  flight every five minutes.
 - adsbdb is a second public service; if it is down the poster still renders
   from the ADS-B data.
 
@@ -126,9 +129,13 @@ The page imitates a framed print:
 - The header shows the radius, the number of aircraft within it, and the feed
   time/date (UTC). The date comes from the feed's `now` field, so no RTC or NTP
   is needed.
-- One aircraft: one large feature card with the airliner above two centred
-  lines. Two: two feature rows with the airliner on the left and the text on
-  the right. Three or four: a 2x2 grid; an odd last card is centred.
+- `AIR_TRAFFIC_MODE` selects the poster composition. One aircraft: one large
+  feature card with the airliner above two text columns. The left column has
+  callsign/type, altitude, route or distance, and a country flag plus the
+  registration; the right column lists the aircraft's latest routes. Two: two
+  feature rows with the airliner on the left and the text on the right. Three
+  or four: a 2x2 grid; an odd last card is centred. Five: three cards on top
+  and two centred below. Six: the real-map view described above.
 - Each card puts the callsign and full aircraft type on one line, then the
   altitude with `climbing`/`descending`/`level` (from `baro_rate`) and route or
   distance/bearing on the next line.
@@ -138,13 +145,21 @@ The page imitates a framed print:
 - Live photos come from JetPhotos/Planespotters; when unavailable, a bundled
   side-view photo for the aircraft family is used. Sources and licences are in
   [`assets/aircraft/ATTRIBUTION.md`](../assets/aircraft/ATTRIBUTION.md).
-- The header count is the total within the radius; the poster shows the nearest
-  four aircraft.
+- The header count is the total within the radius; the poster shows the number
+  of aircraft allowed by the selected mode.
 
 The details line uses the route when adsbdb knows it (`Dublin to Milan`) and
 `12 km / 210 deg` otherwise. Routes are often missing for positioning, ferry
 and ground flights; the ADS-B distance/bearing is always available, so the card
 never has a blank line.
+
+In the single-aircraft layout, the flag comes from the registration prefix
+(`EC-` Spain, `PH-` Netherlands, `G-` United Kingdom, and so on) using the
+generated `src/flags.h` table. The right column lists up to four recent flights
+from JetAPI's FlightRadar24 data, for example `28 Oct Paris > Amsterdam`. That
+list is cached in RTC memory for 30 minutes; when the lookup fails the column
+shows `NO RECENT FLIGHTS`. Regenerate the flags after editing the prefix table
+with `python3 tools/make_flags.py`.
 
 When a live thumbnail is unavailable, the firmware uses a bundled side-view
 photo for the aircraft family: narrowbody (A320/B737/B757), widebody (A330),
@@ -168,20 +183,50 @@ Compile-time defaults live in `include/air_traffic_config.h`:
 | `AIR_TRAFFIC_UPDATE_S` | 300 | Deep-sleep interval |
 | `AIR_TRAFFIC_SLEEP` | 1 | Set to 0 to disable deep sleep |
 | `AIR_TRAFFIC_MAX_AIRCRAFT` | 10 | Nearest aircraft kept while parsing |
-| `AIR_TRAFFIC_PAGE_AIRCRAFT` | 4 | Aircraft visible on the poster |
-| `AIR_TRAFFIC_DEMO` | 0 | 1 = built-in sample feed, no Wi-Fi/API |
-| `AIR_TRAFFIC_DEMO_COUNT` | 4 | Demo aircraft: 1-4 |
+| `AIR_TRAFFIC_PAGE_AIRCRAFT` | 5 | Maximum cards any mode can draw |
+| `AIR_TRAFFIC_MODE` | 0 | 0 auto, 1 demo, 2 one, 3 two, 4 three, 5 five, 6 map |
+| `AIR_TRAFFIC_ACTIVE_CARDS` | mode-dependent | Cards drawn by the selected mode |
+| `AIR_TRAFFIC_DEMO` | derived | 1 only when `AIR_TRAFFIC_MODE=1` |
+| `AIR_TRAFFIC_DEMO_COUNT` | 4 | Demo aircraft: 1-5 |
 
 The radius is also editable in the portal. Latitude, longitude and radius are
 validated before they are saved.
 
-### Demo mode
+### Display modes
 
-The demo feed renders the sample aircraft from the Overhead reference print. It
-does not initialize Wi-Fi, read NVS or call any API:
+`AIR_TRAFFIC_MODE` selects the poster composition at compile time:
+
+| Mode | Aircraft | Layout |
+| --- | --- | --- |
+| `0` | live, up to 4 | 2x2 grid, or fewer |
+| `1` | demo, `AIR_TRAFFIC_DEMO_COUNT` | matches the demo count |
+| `2` | 1 | large feature card with flag, registration/distance and recent routes |
+| `3` | 2 | two feature rows |
+| `4` | 3 | 2x2 grid with the last card centred |
+| `5` | 5 | three on top, two centred below |
+| `6` | live, up to 10 | real street map with aircraft markers |
 
 ```bash
-PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_DEMO=1" pio run -t upload
+PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=2" pio run -t upload
+PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=5" pio run -t upload
+PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=6" pio run -t upload
+```
+
+Mode `0` is the default. `AIR_TRAFFIC_ACTIVE_CARDS` is derived from the mode;
+the poster arrays are sized for five cards, and a larger demo count is clamped
+with a build warning. `AIR_TRAFFIC_DEMO` is no longer set directly: it is 1 only
+in mode 1, and the legacy `-DAIR_TRAFFIC_DEMO=1` flag is accepted as an alias
+for mode 1. Flash without a flag to return to the live auto layout.
+
+#### Demo feed
+
+The demo feed renders the sample aircraft from the Overhead reference print. It
+does not read the saved location or call adsb.lol/adsbdb. It briefly joins the
+saved Wi-Fi network so the cards can use live JetAPI/Planespotters photos; when
+that fails, the bundled fallback photos are used:
+
+```bash
+PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=1" pio run -t upload
 ```
 
 The sample data is in `fill_demo_data()` in `src/air_traffic.cpp`:
@@ -199,15 +244,33 @@ The demo timestamp is `2026-10-22 18:28 UTC` (Thursday), matching the reference.
 The panel hibernates after the render but the ESP32 does not deep-sleep; press
 RESET to redraw.
 
-Use `AIR_TRAFFIC_DEMO_COUNT=1` to `4` to exercise the adaptive layouts:
+Use `AIR_TRAFFIC_DEMO_COUNT=1` to `5` to exercise the adaptive layouts:
 
 ```bash
-PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_DEMO=1 -DAIR_TRAFFIC_DEMO_COUNT=1" \
+PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=1 -DAIR_TRAFFIC_DEMO_COUNT=5" \
   pio run -t upload
 ```
 
-Flash without the flag to return to the live feed. The demo build still
-contains the Wi-Fi/TLS code, so its flash size is unchanged.
+The demo build still contains the Wi-Fi/TLS code, so its flash size is
+unchanged.
+
+#### Map mode
+
+Mode 6 requests a street-map export from Esri ArcGIS centred on the configured
+latitude/longitude. The export covers 10% more than the selected radius and
+has the same 5:3 aspect as the panel. The firmware then draws:
+
+- the map background quantised to four inks (land, water, parks, roads/labels);
+- a black range circle at the configured radius;
+- each aircraft at its ADS-B distance and bearing, rotated by its ground track;
+- callsigns on white labels, the centre coordinates and map attribution;
+- the usual `WITHIN ... KM - N AIRCRAFT` header.
+
+The map is downloaded as a 400x240 JPEG (about 25 KB) and decoded into a 24 KB
+two-bit buffer, then scaled to the 800x480 panel. One HTTPS request is made per
+wake. If the request or decode fails, the firmware falls back to the range-ring
+radar view so the aircraft are still visible. Map data: Esri World Street Map
+(Esri, HERE, Garmin, OpenStreetMap contributors and others).
 
 ## Partition and dependencies
 
@@ -270,16 +333,30 @@ The firmware never buffers the full body or builds a document for all aircraft;
 it keeps only the nearest `AIR_TRAFFIC_MAX_AIRCRAFT`. Peak heap use is therefore
 independent of the radius and does not hit the old `No body memory` failure.
 
-Demo mode skips Wi-Fi and the APIs entirely:
+Demo mode skips adsb.lol/adsbdb and the location lookup. It may briefly join the
+saved Wi-Fi network to fetch card photos, then falls back to the bundled images:
 
 ```text
 image : air traffic (demo)
-[air] demo feed: 4 aircraft
+[air] demo feed: 5 aircraft
 [air] demo render total 27392 ms (panel 26015 ms)
 ```
 
 The demo panel hibernates but the ESP32 stays awake, so the image remains and
 RESET redraws it.
+
+Map mode fetches one ArcGIS street-map JPEG and decodes it after Wi-Fi is
+disconnected:
+
+```text
+[air] map bbox -5.1764,42.3160 - -0.6502,44.2923 (458.3 m/px)
+[air] map: HTTP 200, size 26610
+[air] map decoded in 419 ms, heap 158680
+[air] render total 28693 ms (panel 26024 ms)
+```
+
+The background is stored as 400x240 at two bits per pixel (24 KB) and scaled to
+the 800x480 panel. JPEGDEC adds about 18 KB of heap; no PSRAM is required.
 
 ## Limitations
 
@@ -289,9 +366,12 @@ RESET redraws it.
   bundled per-type photos are shown. No airline logos, painted skies or AI
   artwork.
 - Routes are best-effort. adsbdb may not know a flight, and route lookups add a
-  second API dependency and up to four HTTPS requests per wake; the RTC cache
+  second API dependency and up to five HTTPS requests per wake; the RTC cache
   reduces repeat queries. Distance/bearing is always shown when no route is
   available.
+- Map mode adds one HTTPS request per wake for the Esri street-map export. If
+  the service is unavailable or rate-limits the device, the panel falls back to
+  the range-ring radar view. The map attribution is printed on the panel.
 - TLS certificate verification is disabled (`setInsecure()`) because the
   firmware does not ship a CA bundle. The feed is public and read-only, but a
   man-in-the-middle could alter the displayed data. The public image proxy

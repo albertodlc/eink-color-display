@@ -15,12 +15,14 @@
 
 #include <algorithm>
 #include <math.h>
+#include <new>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #include "air_traffic_config.h"
 #include "fallback_photos.h"
+#include "flags.h"
 
 namespace {
 
@@ -40,12 +42,38 @@ constexpr int16_t kGridCardW = 379;
 constexpr int16_t kGridCardH = 214;
 constexpr int16_t kGridGapX = 10;
 constexpr int16_t kGridGapY = 8;
+constexpr int16_t kFiveCardW = 249;
+constexpr int16_t kFiveCardH = 214;
+constexpr int16_t kFiveGapX = 10;
+constexpr int16_t kFiveGapY = 8;
 
 // Photo cards: 280x96, four bits per pixel, six-colour palette indices.
 constexpr int16_t kPhotoW = 320;
 constexpr int16_t kPhotoH = 128;
 constexpr uint16_t kPhotoBytes = (kPhotoW * kPhotoH * 3 + 7) / 8 + 2;
 constexpr size_t kJpegBufferSize = 32 * 1024;
+
+#if AIR_TRAFFIC_MODE == 6
+// The street map is downloaded at 400x240 from the ArcGIS export and stored as
+// four inks (2 bits per pixel). It is scaled to 800x480 when drawn, so the
+// projection scale below refers to the display pixels.
+constexpr int16_t kMapImageW = 400;
+constexpr int16_t kMapImageH = 240;
+constexpr uint16_t kMapRowBytes = kMapImageW / 4;
+constexpr uint32_t kMapBytes = (uint32_t)kMapRowBytes * kMapImageH;
+constexpr size_t kMapJpegCapacity = 64 * 1024;
+constexpr int16_t kMapDisplayW = epd::kWidth;
+constexpr int16_t kMapDisplayH = epd::kHeight;
+constexpr int16_t kMapCenterX = kMapDisplayW / 2;
+constexpr int16_t kMapCenterY = 256;
+constexpr int16_t kMapOffsetY = 16;
+
+uint8_t* g_map_pixels = nullptr;
+uint8_t* g_map_jpeg = nullptr;
+size_t g_map_jpeg_size = 0;
+float g_map_m_per_px = 447.0f;
+bool g_map_ready = false;
+#endif
 
 // Measured Spectra 6 appearance (Zephyr reTerminal E1002 reference panel).
 // If this panel looks too bright, try the darker approximation used by the
@@ -81,9 +109,32 @@ struct PhotoView {
 // Wi-Fi/TLS, so this is much more reliable than one large block.
 PhotoCard* g_photos[AIR_TRAFFIC_PAGE_AIRCRAFT] = {};
 
+// Latest flights for the single-aircraft mode. JetAPI scrapes FlightRadar24's
+// per-aircraft flight list; keep the last answer in RTC memory so a five-minute
+// wake does not hit the API again for the same aircraft.
+constexpr uint8_t kFlightHistoryLegs = 4;
+constexpr uint32_t kFlightHistoryTtlS = 30 * 60;
+constexpr uint32_t kFlightHistoryMagic = 0x464C4853;  // "FLHS"
+
+struct FlightHistoryLeg {
+  char date[12];
+  char from[20];
+  char to[20];
+};
+
+struct FlightHistory {
+  uint32_t magic;
+  char registration[10];
+  uint32_t fetched;
+  uint8_t count;
+  FlightHistoryLeg legs[kFlightHistoryLegs];
+};
+
+RTC_DATA_ATTR FlightHistory g_flight_history;
+
 bool ensure_photo_store() {
   bool ok = true;
-  for (uint8_t i = 0; i < AIR_TRAFFIC_PAGE_AIRCRAFT; i++) {
+  for (uint8_t i = 0; i < AIR_TRAFFIC_ACTIVE_CARDS; i++) {
     if (!g_photos[i]) {
       g_photos[i] = (PhotoCard*)malloc(sizeof(PhotoCard));
     }
@@ -201,6 +252,22 @@ void format_last_line(const AirTrafficAircraft& aircraft, char* out,
     snprintf(out, size, "%s", aircraft.route);
   } else {
     format_distance(aircraft, out, size);
+  }
+}
+
+// Single-aircraft cards have room for a registration line. Keep the
+// distance/bearing on it as well, unless the detail line already shows them
+// because the route is unknown.
+void format_registration_line(const AirTrafficAircraft& aircraft, char* out,
+                              size_t size) {
+  out[0] = 0;
+  if (!aircraft.registration[0]) return;
+  if (aircraft.route[0]) {
+    char distance[32];
+    format_distance(aircraft, distance, sizeof(distance));
+    snprintf(out, size, "%s - %s", aircraft.registration, distance);
+  } else {
+    snprintf(out, size, "%s", aircraft.registration);
   }
 }
 
@@ -629,6 +696,97 @@ bool planespotters_thumbnail(const char* registration, char* out, size_t size) {
   return true;
 }
 
+bool https_get(const char* url, String& payload, uint16_t timeout_ms) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(timeout_ms);
+  http.setUserAgent("eink-color-display/1.0 (ESP32)");
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  if (!http.begin(client, url)) {
+    return false;
+  }
+  const int code = http.GET();
+  if (code != 200) {
+    Serial.printf("[air] history: HTTP %d (%s)\n", code,
+                  http.errorToString(code).c_str());
+    http.end();
+    return false;
+  }
+  payload = http.getString();
+  http.end();
+  return payload.length() > 0;
+}
+
+void fetch_flight_history(const AirTrafficAircraft& aircraft, uint32_t now) {
+#if AIR_TRAFFIC_MODE == 2
+  if (!aircraft.registration[0]) return;
+
+  const bool valid_cache = g_flight_history.magic == kFlightHistoryMagic;
+  const bool same_aircraft =
+      valid_cache &&
+      strcmp(g_flight_history.registration, aircraft.registration) == 0;
+  if (same_aircraft && now != 0 && g_flight_history.fetched != 0 &&
+      now >= g_flight_history.fetched &&
+      now - g_flight_history.fetched < kFlightHistoryTtlS) {
+    return;
+  }
+  if (!same_aircraft) {
+    g_flight_history.registration[0] = 0;
+    g_flight_history.fetched = 0;
+    g_flight_history.count = 0;
+  }
+
+  char api[192];
+  snprintf(api, sizeof(api),
+           "https://www.jetapi.dev/api?reg=%s&photos=0&flights=%u",
+           aircraft.registration, (unsigned)kFlightHistoryLegs);
+
+  String payload;
+  if (!https_get(api, payload, 8000)) {
+    Serial.printf("[air] history %s: fetch failed\n", aircraft.registration);
+    return;
+  }
+
+  JsonDocument filter;
+  filter["FlightRadar"]["Flights"][0]["Date"] = true;
+  filter["FlightRadar"]["Flights"][0]["From"] = true;
+  filter["FlightRadar"]["Flights"][0]["To"] = true;
+  JsonDocument doc;
+  if (deserializeJson(doc, payload, DeserializationOption::Filter(filter))) {
+    Serial.printf("[air] history %s: bad JSON\n", aircraft.registration);
+    return;
+  }
+
+  const JsonArray flights = doc["FlightRadar"]["Flights"].as<JsonArray>();
+  uint8_t count = 0;
+  for (const JsonObject flight : flights) {
+    const char* from = flight["From"] | "";
+    const char* to = flight["To"] | "";
+    if (!from[0] || !to[0]) continue;
+    if (count >= kFlightHistoryLegs) break;
+    FlightHistoryLeg& leg = g_flight_history.legs[count];
+    snprintf(leg.date, sizeof(leg.date), "%s", flight["Date"] | "");
+    snprintf(leg.from, sizeof(leg.from), "%s", from);
+    snprintf(leg.to, sizeof(leg.to), "%s", to);
+    count++;
+  }
+
+  snprintf(g_flight_history.registration,
+           sizeof(g_flight_history.registration), "%s",
+           aircraft.registration);
+  g_flight_history.magic = kFlightHistoryMagic;
+  g_flight_history.fetched = now;
+  g_flight_history.count = count;
+  Serial.printf("[air] history %s: %u flights\n", aircraft.registration,
+                (unsigned)count);
+  Serial.flush();
+#else
+  (void)aircraft;
+  (void)now;
+#endif
+}
+
 void weserv_url(const char* source, char* out, size_t size) {
   snprintf(out, size,
            "http://images.weserv.nl/?url=%s&w=%d&h=%d&fit=cover"
@@ -637,43 +795,52 @@ void weserv_url(const char* source, char* out, size_t size) {
 }
 
 bool download_photo(const char* url, uint8_t*& buffer, size_t capacity,
-                    size_t& length) {
+                    size_t& length, const char* label = "photo",
+                    const char* referer = "https://www.jetphotos.com/",
+                    bool secure = false) {
   length = 0;
   buffer = nullptr;
-  // The image proxy is public and read-only. Plain HTTP avoids a second TLS
-  // handshake next to the live photo buffers; the metadata APIs stay on HTTPS.
-  WiFiClient client;
+  // Photos use the public image proxy over plain HTTP to avoid a second TLS
+  // handshake next to the live photo buffers. The map export is fetched over
+  // HTTPS through the optional secure client.
+  WiFiClient plain;
+  WiFiClientSecure tls;
+  NetworkClient* client = &plain;
+  if (secure) {
+    tls.setInsecure();
+    client = &tls;
+  }
   HTTPClient http;
   http.setTimeout(20000);
   http.setUserAgent(
       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120 Safari/537.36");
-  http.addHeader("Referer", "https://www.jetphotos.com/");
+  if (referer) http.addHeader("Referer", referer);
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  Serial.printf("[air] photo URL: %s\n", url);
-  if (!http.begin(client, url)) {
-    Serial.println("[air] photo: begin failed");
+  Serial.printf("[air] %s URL: %s\n", label, url);
+  if (!http.begin(*client, url)) {
+    Serial.printf("[air] %s: begin failed\n", label);
     return false;
   }
 
   const int code = http.GET();
   const int size = http.getSize();
   if (code != 200) {
-    Serial.printf("[air] photo: HTTP %d\n", code);
+    Serial.printf("[air] %s: HTTP %d\n", label, code);
     http.end();
     return false;
   }
   if (size <= 0 || (size_t)size > capacity) {
-    Serial.printf("[air] photo: size %d (capacity %u)\n", size,
+    Serial.printf("[air] %s: size %d (capacity %u)\n", label, size,
                   (unsigned)capacity);
     http.end();
     return false;
   }
-  Serial.printf("[air] photo: HTTP 200, size %d\n", size);
+  Serial.printf("[air] %s: HTTP 200, size %d\n", label, size);
 
   buffer = (uint8_t*)malloc((size_t)size);
   if (!buffer) {
-    Serial.printf("[air] photo: body allocation failed, heap %u\n",
+    Serial.printf("[air] %s: body allocation failed, heap %u\n", label,
                   (unsigned)ESP.getFreeHeap());
     http.end();
     return false;
@@ -701,7 +868,7 @@ bool download_photo(const char* url, uint8_t*& buffer, size_t capacity,
   }
   http.end();
   length = total;
-  Serial.printf("[air] photo: read %u/%d bytes\n", (unsigned)total, size);
+  Serial.printf("[air] %s: read %u/%d bytes\n", label, (unsigned)total, size);
   if (total != (size_t)size) {
     free(buffer);
     buffer = nullptr;
@@ -709,6 +876,155 @@ bool download_photo(const char* url, uint8_t*& buffer, size_t capacity,
   }
   return true;
 }
+
+#if AIR_TRAFFIC_MODE == 6
+uint8_t map_index_from_rgb(uint8_t r, uint8_t g, uint8_t b) {
+  // OSM standard colours: light blue water, pale green parks, white land,
+  // dark/grey roads, borders and labels. Classify by hue and luminance rather
+  // than by Euclidean distance so the sea remains blue on the six-ink panel.
+  if (b > r + 25 && b >= g - 5) return 1;  // water -> blue
+  if (g > r + 10 && g > b + 5) return 2;   // parks -> green
+  const uint8_t mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+  const uint8_t mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+  const uint8_t luminance = (uint8_t)((r * 3 + g * 4 + b * 2) / 9);
+  if (luminance < 170 || (uint8_t)(mx - mn) > 70) return 3;  // roads/text
+  return 0;  // land
+}
+
+bool fetch_map_image(const AirTrafficConfig& config) {
+  if (g_map_jpeg) {
+    free(g_map_jpeg);
+    g_map_jpeg = nullptr;
+    g_map_jpeg_size = 0;
+  }
+
+  // A plate-carree export around the configured centre. The bbox is 10%
+  // larger than the configured radius and has the same 5:3 aspect as the
+  // panel, so the range circle fits below the header bar.
+  const float half_lat = (float)config.radius_km * 1.1f / 111.32f;
+  float cos_lat = cosf((float)config.lat * PI / 180.0f);
+  if (cos_lat < 0.05f) cos_lat = 0.05f;
+  const float half_lon =
+      half_lat * (float)kMapDisplayW / (float)kMapDisplayH / cos_lat;
+  g_map_m_per_px =
+      (2.0f * half_lat * 111320.0f) / (float)kMapDisplayH;
+
+  char url[384];
+  snprintf(url, sizeof(url),
+           "https://server.arcgisonline.com/ArcGIS/rest/services/"
+           "World_Street_Map/MapServer/export"
+           "?bbox=%.5f,%.5f,%.5f,%.5f&bboxSR=4326&imageSR=4326"
+           "&size=%d,%d&format=jpg&f=image",
+           config.lon - half_lon, config.lat - half_lat,
+           config.lon + half_lon, config.lat + half_lat,
+           (int)kMapImageW, (int)kMapImageH);
+
+  Serial.printf("[air] map bbox %.4f,%.4f - %.4f,%.4f (%.1f m/px)\n",
+                config.lon - half_lon, config.lat - half_lat,
+                config.lon + half_lon, config.lat + half_lat,
+                g_map_m_per_px);
+  Serial.flush();
+  if (!download_photo(url, g_map_jpeg, kMapJpegCapacity, g_map_jpeg_size,
+                      "map", nullptr, true)) {
+    Serial.println("[air] map image: download failed");
+    g_map_jpeg = nullptr;
+    return false;
+  }
+  Serial.printf("[air] map image: %u bytes\n", (unsigned)g_map_jpeg_size);
+  Serial.flush();
+  return true;
+}
+
+int jpeg_map_draw_callback(JPEGDRAW* draw) {
+  if (!g_map_pixels) return 1;
+  for (int yy = 0; yy < draw->iHeight; yy++) {
+    const int y = draw->y + yy;
+    if (y < 0 || y >= kMapImageH) continue;
+    for (int xx = 0; xx < draw->iWidthUsed; xx++) {
+      const int x = draw->x + xx;
+      if (x < 0 || x >= kMapImageW) continue;
+
+      const uint16_t rgb565 = draw->pPixels[yy * draw->iWidth + xx];
+      const uint8_t r5 = (uint8_t)((rgb565 >> 11) & 0x1F);
+      const uint8_t g6 = (uint8_t)((rgb565 >> 5) & 0x3F);
+      const uint8_t b5 = (uint8_t)(rgb565 & 0x1F);
+      const uint8_t r = (uint8_t)((r5 << 3) | (r5 >> 2));
+      const uint8_t g = (uint8_t)((g6 << 2) | (g6 >> 4));
+      const uint8_t b = (uint8_t)((b5 << 3) | (b5 >> 2));
+
+      const uint8_t index = map_index_from_rgb(r, g, b);
+      const size_t byte = (size_t)y * kMapRowBytes + (x >> 2);
+      const uint8_t shift = (uint8_t)((x & 3) * 2);
+      g_map_pixels[byte] =
+          (uint8_t)((g_map_pixels[byte] & ~(3u << shift)) | (index << shift));
+    }
+  }
+  return 1;
+}
+
+bool decode_map_image() {
+  if (!g_map_jpeg) return false;
+
+  Serial.printf("[air] map decode start: heap %u, largest %u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)ESP.getMaxAllocHeap());
+  if (!g_map_pixels) {
+    g_map_pixels = (uint8_t*)malloc(kMapBytes);
+    if (!g_map_pixels) {
+      Serial.printf("[air] map buffer: allocation failed, heap %u, largest %u\n",
+                    (unsigned)ESP.getFreeHeap(),
+                    (unsigned)ESP.getMaxAllocHeap());
+      free(g_map_jpeg);
+      g_map_jpeg = nullptr;
+      g_map_jpeg_size = 0;
+      return false;
+    }
+    memset(g_map_pixels, 0, kMapBytes);
+  }
+
+  Serial.printf("[air] map after buffer: heap %u, largest %u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)ESP.getMaxAllocHeap());
+  // The decoder is allocated on the heap: a static object overflowed the
+  // ESP32's DRAM segment. The pixel buffer is small enough to coexist.
+  JPEGDEC* decoder = new (std::nothrow) JPEGDEC();
+  if (!decoder) {
+    Serial.printf("[air] map decoder: allocation failed, heap %u, largest %u\n",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getMaxAllocHeap());
+    free(g_map_pixels);
+    g_map_pixels = nullptr;
+    free(g_map_jpeg);
+    g_map_jpeg = nullptr;
+    g_map_jpeg_size = 0;
+    return false;
+  }
+
+  const uint32_t started = millis();
+  const int opened = decoder->openRAM(g_map_jpeg, (int)g_map_jpeg_size,
+                                      jpeg_map_draw_callback);
+  const int decoded = opened ? decoder->decode(0, 0, 0) : 0;
+  delete decoder;
+
+  free(g_map_jpeg);
+  g_map_jpeg = nullptr;
+  g_map_jpeg_size = 0;
+
+  if (!decoded) {
+    Serial.printf("[air] map decode failed, heap %u\n",
+                  (unsigned)ESP.getFreeHeap());
+    free(g_map_pixels);
+    g_map_pixels = nullptr;
+    return false;
+  }
+  Serial.printf("[air] map decoded in %lu ms, heap %u\n",
+                (unsigned long)(millis() - started),
+                (unsigned)ESP.getFreeHeap());
+  Serial.flush();
+  g_map_ready = true;
+  return true;
+}
+#endif
 
 struct PhotoUrlCache {
   char registration[10];
@@ -801,7 +1117,7 @@ void fetch_photos(AirTrafficData& data) {
   // The TLS handshake for JetAPI/Planespotters needs more headroom than the
   // image downloads that follow.
   static PhotoUrl photo_urls[AIR_TRAFFIC_PAGE_AIRCRAFT];
-  for (uint8_t i = 0; i < AIR_TRAFFIC_PAGE_AIRCRAFT; i++) {
+  for (uint8_t i = 0; i < AIR_TRAFFIC_ACTIVE_CARDS; i++) {
     photo_urls[i].valid = false;
     if (i >= data.count) continue;
     AirTrafficAircraft& aircraft = data.aircraft[i];
@@ -809,6 +1125,7 @@ void fetch_photos(AirTrafficData& data) {
     photo_urls[i].valid =
         find_photo_url(aircraft.registration, data.feed_time,
                        photo_urls[i].url, sizeof(photo_urls[i].url));
+    fetch_flight_history(aircraft, data.feed_time);
   }
 
   if (!ensure_photo_store()) {
@@ -818,11 +1135,11 @@ void fetch_photos(AirTrafficData& data) {
   }
   Serial.printf("[air] photo buffers: heap %u\n",
                 (unsigned)ESP.getFreeHeap());
-  for (uint8_t i = 0; i < AIR_TRAFFIC_PAGE_AIRCRAFT; i++) {
+  for (uint8_t i = 0; i < AIR_TRAFFIC_ACTIVE_CARDS; i++) {
     if (g_photos[i]) g_photos[i]->valid = false;
   }
 
-  for (uint8_t i = 0; i < data.count && i < AIR_TRAFFIC_PAGE_AIRCRAFT; i++) {
+  for (uint8_t i = 0; i < data.count && i < AIR_TRAFFIC_ACTIVE_CARDS; i++) {
     if (!photo_urls[i].valid) continue;
     AirTrafficAircraft& aircraft = data.aircraft[i];
 
@@ -881,6 +1198,108 @@ void draw_centered(epd::Display& display, int16_t x, int16_t y, int16_t width,
   display.setTextSize(size);
   display.setTextColor(color);
   display.setCursor(x + (width - text_width(text, size)) / 2, y);
+  display.print(text);
+}
+
+void draw_centered_fit(epd::Display& display, int16_t x, int16_t y,
+                       int16_t width, const char* text, uint8_t size,
+                       uint8_t min_size, uint16_t color) {
+  while (size > min_size && text_width(text, size) > width) {
+    size--;
+  }
+  draw_centered(display, x, y, width, text, size, color);
+}
+
+struct RegistrationFlag {
+  const char* prefix;
+  FlagId flag;
+};
+
+// Registration prefixes, longest match first. C- is Canada, so the longer
+// CC-/CN-/CS-/CU-/CX- prefixes must win; B-H/K/L are Hong Kong, not China.
+const RegistrationFlag kRegistrationFlags[] = {
+    // Europe
+    {"EC-", kFlagES}, {"PH-", kFlagNL}, {"F-", kFlagFR},
+    {"D-", kFlagDE},  {"G-", kFlagGB},  {"CS-", kFlagPT},
+    {"EI-", kFlagIE}, {"OE-", kFlagAT}, {"HB-", kFlagCH},
+    {"I-", kFlagIT},  {"OO-", kFlagBE}, {"SP-", kFlagPL},
+    {"OK-", kFlagCZ}, {"LN-", kFlagNO}, {"SE-", kFlagSE},
+    {"OY-", kFlagDK}, {"OH-", kFlagFI}, {"SX-", kFlagGR},
+    {"TC-", kFlagTR}, {"9H-", kFlagMT}, {"5B-", kFlagCY},
+    {"9A-", kFlagHR}, {"S5-", kFlagSI}, {"HA-", kFlagHU},
+    {"YR-", kFlagRO}, {"LZ-", kFlagBG}, {"YU-", kFlagRS},
+    {"UR-", kFlagUA}, {"RA-", kFlagRU}, {"RF-", kFlagRU},
+    {"LX-", kFlagLU}, {"TF-", kFlagIS},
+    // Americas
+    {"N", kFlagUS},   {"C-", kFlagCA},  {"C6-", kFlagNone},
+    {"CC-", kFlagCL}, {"CU-", kFlagCU}, {"CX-", kFlagUY},
+    {"XA-", kFlagMX}, {"XB-", kFlagMX}, {"LV-", kFlagAR},
+    {"HK-", kFlagCO}, {"PP-", kFlagBR}, {"PR-", kFlagBR},
+    {"PT-", kFlagBR}, {"PU-", kFlagBR},
+    // Asia and the Middle East
+    {"JA", kFlagJP},  {"HL", kFlagKR},  {"B-", kFlagCN},
+    {"B-H", kFlagHK}, {"B-K", kFlagHK}, {"B-L", kFlagHK},
+    {"A6-", kFlagAE}, {"A7-", kFlagQA}, {"HZ-", kFlagSA},
+    {"VT-", kFlagIN}, {"9V-", kFlagSG}, {"4X-", kFlagIL},
+    {"HS-", kFlagTH}, {"9M-", kFlagMY}, {"PK-", kFlagID},
+    {"RP-", kFlagPH}, {"VN-", kFlagVN}, {"AP-", kFlagPK},
+    {"S2-", kFlagBD}, {"4R-", kFlagLK},
+    // Africa and Oceania
+    {"CN-", kFlagMA}, {"7T-", kFlagDZ}, {"TS-", kFlagTN},
+    {"SU-", kFlagEG}, {"5Y-", kFlagKE}, {"ET-", kFlagET},
+    {"5N-", kFlagNG}, {"ZS-", kFlagZA}, {"VH-", kFlagAU},
+    {"ZK-", kFlagNZ},
+};
+
+FlagId flag_for_registration(const char* registration) {
+  FlagId best = kFlagNone;
+  size_t best_length = 0;
+  for (const RegistrationFlag& entry : kRegistrationFlags) {
+    const size_t length = strlen(entry.prefix);
+    if (length <= best_length) continue;
+    if (strncmp(registration, entry.prefix, length) == 0) {
+      best = entry.flag;
+      best_length = length;
+    }
+  }
+  return best;
+}
+
+void draw_flag(epd::Display& display, FlagId flag, int16_t x, int16_t y) {
+  if (flag == kFlagNone || flag >= kFlagCount) return;
+  display.drawRect(x, y, kFlagWidth + 2, kFlagHeight + 2, GxEPD_BLACK);
+  const uint8_t* pixels = kFlagData[flag];
+  for (uint8_t fy = 0; fy < kFlagHeight; fy++) {
+    const uint8_t* row = pixels + (size_t)fy * kFlagRowBytes;
+    for (uint8_t fx = 0; fx < kFlagWidth; fx++) {
+      const uint8_t packed = row[fx >> 1];
+      const uint8_t index = (fx & 1) ? (packed >> 4) : (packed & 0x0F);
+      if (index < 6) {
+        display.drawPixel(x + 1 + fx, y + 1 + fy, kPhotoColors[index]);
+      }
+    }
+  }
+}
+
+void draw_registration_line(epd::Display& display, int16_t x, int16_t y,
+                            int16_t width, const char* text, FlagId flag) {
+  if (flag == kFlagNone) {
+    draw_centered_fit(display, x, y, width, text, 2, 1, GxEPD_BLACK);
+    return;
+  }
+
+  constexpr int16_t kGap = 6;
+  const int16_t flag_w = kFlagWidth + 2;
+  uint8_t size = 2;
+  while (size > 1 && flag_w + kGap + text_width(text, size) > width) {
+    size--;
+  }
+  const int16_t total = flag_w + kGap + text_width(text, size);
+  const int16_t start = x + (width - total) / 2;
+  draw_flag(display, flag, start, y - (kFlagHeight + 2 - 16) / 2);
+  display.setTextSize(size);
+  display.setTextColor(GxEPD_BLACK);
+  display.setCursor(start + flag_w + kGap, y + (16 - 8 * size) / 2);
   display.print(text);
 }
 
@@ -1268,6 +1687,7 @@ class AdsbFeedReader {
     filter["lon"] = true;
     filter["dst"] = true;
     filter["dir"] = true;
+    filter["track"] = true;
 
     JsonDocument doc;
     uint64_t now = 0;
@@ -1597,6 +2017,14 @@ class AdsbFeedReader {
 
     out.distance_km = (int)lroundf(km);
     out.bearing_deg = ((int)lroundf(bearing)) % 360;
+    out.heading_deg = -1;
+    JsonVariant track = doc["track"];
+    if (track.is<int>()) {
+      out.heading_deg = track.as<int>() % 360;
+    } else if (track.is<float>()) {
+      out.heading_deg = (int)lroundf(track.as<float>()) % 360;
+    }
+    if (out.heading_deg < 0) out.heading_deg += 360;
 
     if (data.count < AIR_TRAFFIC_MAX_AIRCRAFT) {
       data.aircraft[data.count++] = out;
@@ -1695,12 +2123,17 @@ bool fetch_traffic(AirTrafficData& data, const AirTrafficConfig& config) {
               return a.distance_km < b.distance_km;
             });
   data.ok = true;
+#if AIR_TRAFFIC_MODE == 6
+  fetch_map_image(config);
+#endif
+#if AIR_TRAFFIC_MODE != 6
   // Routes first while the heap is still roomy; photos need the large working
-  // buffers and are fetched afterwards.
-  for (uint8_t i = 0; i < data.count && i < AIR_TRAFFIC_PAGE_AIRCRAFT; i++) {
+  // buffers and are fetched afterwards. Map mode needs neither.
+  for (uint8_t i = 0; i < data.count && i < AIR_TRAFFIC_ACTIVE_CARDS; i++) {
     resolve_route(data.aircraft[i], data.feed_time);
   }
   fetch_photos(data);
+#endif
   Serial.printf("[air] %u aircraft within %d km (%u stored)\n",
                 data.total_within_radius, config.radius_km, data.count);
   return true;
@@ -1874,19 +2307,35 @@ struct PosterCard {
 };
 
 uint8_t build_layout(const AirTrafficData& data, PosterCard* cards) {
-  const uint8_t shown = data.count > AIR_TRAFFIC_PAGE_AIRCRAFT
-                            ? AIR_TRAFFIC_PAGE_AIRCRAFT
+  const uint8_t shown = data.count > AIR_TRAFFIC_ACTIVE_CARDS
+                            ? AIR_TRAFFIC_ACTIVE_CARDS
                             : data.count;
   if (shown == 0) return 0;
   if (shown == 1) {
-    // Give the single aircraft almost the whole body area.
-    cards[0] = {20, 34, 760, 400, 0, 1};
+    // Give the single aircraft the full body height. The extra room below the
+    // photo keeps a clear gap before the three description lines.
+    cards[0] = {20, kBodyTop, 760, (int16_t)(kBodyBottom - kBodyTop), 0, 1};
     return 1;
   }
   if (shown == 2) {
     cards[0] = {20, 34, 760, 214, 0, 2};
     cards[1] = {20, 256, 760, 214, 1, 2};
     return 2;
+  }
+  if (shown == 5) {
+    // Three cards on top, two centred below.
+    for (uint8_t i = 0; i < 3; i++) {
+      cards[i] = {(int16_t)(16 + i * (kFiveCardW + kFiveGapX)),
+                  kBodyTop, kFiveCardW, kFiveCardH, i, 0};
+    }
+    const int16_t bottom_top = kBodyTop + kFiveCardH + kFiveGapY;
+    const int16_t bottom_x =
+        (epd::kWidth - (2 * kFiveCardW + kFiveGapX)) / 2;
+    for (uint8_t i = 3; i < 5; i++) {
+      cards[i] = {(int16_t)(bottom_x + (i - 3) * (kFiveCardW + kFiveGapX)),
+                  bottom_top, kFiveCardW, kFiveCardH, i, 0};
+    }
+    return 5;
   }
 
   const uint8_t rows = (shown + 1) / 2;
@@ -1917,6 +2366,8 @@ void draw_card(epd::Display& display, const PosterCard& card,
           ? PhotoView{live_photo->pixels, (uint16_t)kPhotoW,
                       (uint16_t)kPhotoH, PhotoFormat::Packed3}
           : fallback_photo_for_type(aircraft.type);
+  const FlagId registration_flag =
+      flag_for_registration(aircraft.registration);
 
   char altitude[32];
   char last_line[48];
@@ -1933,10 +2384,69 @@ void draw_card(epd::Display& display, const PosterCard& card,
                  page_top, page_bottom);
     }
 
-    draw_flight_and_type(display, card.x, card.y + 310, card.w,
+#if AIR_TRAFFIC_MODE == 2
+    // Two columns: current flight on the left, the aircraft's latest routes
+    // from FlightRadar24 on the right. The photo keeps its full width above.
+    const int16_t text_top = card.y + 326;
+    const int16_t left_x = card.x + 8;
+    const int16_t left_w = 372;
+    const int16_t right_x = card.x + 404;
+    const int16_t right_w = card.w - 412;
+
+    display.drawFastVLine(card.x + 392, text_top - 4, 110, GxEPD_BLACK);
+    draw_flight_and_type(display, left_x, text_top, left_w,
                          aircraft.callsign, aircraft.type_name, 3, 2);
-    draw_flight_details(display, card.x, card.y + 338, card.w, altitude,
+    draw_centered_fit(display, left_x, text_top + 28, left_w, altitude, 2, 1,
+                      GxEPD_BLACK);
+    draw_centered_fit(display, left_x, text_top + 52, left_w, last_line, 2, 1,
+                      GxEPD_BLACK);
+
+    char registration[64];
+    format_registration_line(aircraft, registration, sizeof(registration));
+    if (registration[0]) {
+      draw_registration_line(display, left_x, text_top + 76, left_w,
+                             registration, registration_flag);
+      if (registration_flag != kFlagNone) {
+        draw_centered(display, left_x, text_top + 98, left_w,
+                      kFlagNames[registration_flag], 1, GxEPD_BLACK);
+      }
+    }
+
+    draw_centered(display, right_x, text_top, right_w, "ROUTE HISTORY", 2,
+                  GxEPD_BLACK);
+    if (g_flight_history.count == 0) {
+      draw_centered(display, right_x, text_top + 30, right_w,
+                    "NO RECENT FLIGHTS", 1, GxEPD_BLACK);
+    } else {
+      const uint8_t rows = g_flight_history.count < kFlightHistoryLegs
+                               ? g_flight_history.count
+                               : kFlightHistoryLegs;
+      for (uint8_t i = 0; i < rows; i++) {
+        const FlightHistoryLeg& leg = g_flight_history.legs[i];
+        char line[64];
+        snprintf(line, sizeof(line), "%.6s %s > %s", leg.date, leg.from,
+                 leg.to);
+        draw_centered_fit(display, right_x, text_top + 28 + i * 20, right_w,
+                          line, 2, 1, GxEPD_BLACK);
+      }
+    }
+#else
+    draw_flight_and_type(display, card.x, card.y + 326, card.w,
+                         aircraft.callsign, aircraft.type_name, 3, 2);
+    draw_flight_details(display, card.x, card.y + 354, card.w, altitude,
                         last_line, 2);
+
+    char registration[64];
+    format_registration_line(aircraft, registration, sizeof(registration));
+    if (registration[0]) {
+      draw_registration_line(display, card.x, card.y + 382, card.w,
+                             registration, registration_flag);
+      if (registration_flag != kFlagNone) {
+        draw_centered(display, card.x, card.y + 404, card.w,
+                      kFlagNames[registration_flag], 1, GxEPD_BLACK);
+      }
+    }
+#endif
   } else if (card.kind == 2) {
     const int16_t box_x = card.x + 10;
     const int16_t box_y = card.y + 8;
@@ -2006,6 +2516,284 @@ void draw_empty_page(epd::Display& display, const AirTrafficData& data) {
   draw_centered(display, 0, 250, epd::kWidth, sub, 2, GxEPD_BLACK);
 }
 
+#if AIR_TRAFFIC_MODE == 6
+constexpr int16_t kRadarCenterX = epd::kWidth / 2;
+constexpr int16_t kRadarCenterY = (kBodyTop + kBodyBottom) / 2;
+constexpr int16_t kRadarRadius = 195;
+
+void draw_plane_symbol(epd::Display& display, int16_t x, int16_t y,
+                       int heading_deg, uint16_t color) {
+  const float rad = heading_deg * PI / 180.0f;
+  const float fx = sinf(rad);
+  const float fy = -cosf(rad);
+  const float wx = cosf(rad);
+  const float wy = sinf(rad);
+
+  const int16_t nose_x = x + (int16_t)lroundf(fx * 7);
+  const int16_t nose_y = y + (int16_t)lroundf(fy * 7);
+  const int16_t tail_x = x - (int16_t)lroundf(fx * 5);
+  const int16_t tail_y = y - (int16_t)lroundf(fy * 5);
+  const int16_t wing1_x = x + (int16_t)lroundf(wx * 4 - fx);
+  const int16_t wing1_y = y + (int16_t)lroundf(wy * 4 - fy);
+  const int16_t wing2_x = x - (int16_t)lroundf(wx * 4 + fx);
+  const int16_t wing2_y = y - (int16_t)lroundf(wy * 4 + fy);
+
+  display.drawLine(tail_x, tail_y, nose_x, nose_y, color);
+  display.drawLine(wing1_x, wing1_y, wing2_x, wing2_y, color);
+  display.drawLine(tail_x, tail_y, wing1_x, wing1_y, color);
+  display.drawLine(tail_x, tail_y, wing2_x, wing2_y, color);
+}
+
+void draw_radar_map(epd::Display& display, const AirTrafficData& data,
+                    int16_t page_top, int16_t page_bottom) {
+  const int16_t cx = kRadarCenterX;
+  const int16_t cy = kRadarCenterY;
+  const int16_t radius = kRadarRadius;
+
+  // Range rings, crosshair and outer ticks.
+  if (intersects(cy - radius, cy + radius + 1, page_top, page_bottom)) {
+    display.drawCircle(cx, cy, radius, GxEPD_BLACK);
+    display.drawCircle(cx, cy, radius * 3 / 4, GxEPD_BLACK);
+    display.drawCircle(cx, cy, radius / 2, GxEPD_BLACK);
+    display.drawCircle(cx, cy, radius / 4, GxEPD_BLACK);
+    display.drawFastVLine(cx, cy - radius, radius * 2, GxEPD_BLACK);
+    display.drawFastHLine(cx - radius, cy, radius * 2, GxEPD_BLACK);
+  }
+
+  for (int16_t deg = 0; deg < 360; deg += 30) {
+    const float rad = deg * PI / 180.0f;
+    const int16_t x1 = cx + (int16_t)lroundf(sinf(rad) * radius);
+    const int16_t y1 = cy - (int16_t)lroundf(cosf(rad) * radius);
+    const int16_t x2 = cx + (int16_t)lroundf(sinf(rad) * (radius + 6));
+    const int16_t y2 = cy - (int16_t)lroundf(cosf(rad) * (radius + 6));
+    const int16_t top = y1 < y2 ? y1 : y2;
+    const int16_t bottom = y1 < y2 ? y2 : y1;
+    if (intersects(top, bottom + 1, page_top, page_bottom)) {
+      display.drawLine(x1, y1, x2, y2, GxEPD_BLACK);
+    }
+  }
+
+  const int16_t north_y = cy - radius - 18;
+  if (intersects(north_y, north_y + 16, page_top, page_bottom)) {
+    draw_centered(display, cx - 20, north_y, 40, "N", 2, GxEPD_BLACK);
+  }
+  const int16_t south_y = cy + radius + 4;
+  if (intersects(south_y, south_y + 16, page_top, page_bottom)) {
+    draw_centered(display, cx - 20, south_y, 40, "S", 2, GxEPD_BLACK);
+  }
+  const int16_t side_y = cy - 8;
+  if (intersects(side_y, side_y + 16, page_top, page_bottom)) {
+    draw_centered(display, cx + radius + 2, side_y, 30, "E", 2, GxEPD_BLACK);
+    draw_centered(display, cx - radius - 32, side_y, 30, "W", 2, GxEPD_BLACK);
+  }
+
+  // Home position at the centre of the configured radius.
+  if (intersects(cy - 8, cy + 12, page_top, page_bottom)) {
+    display.fillCircle(cx, cy, 4, GxEPD_BLUE);
+    display.drawCircle(cx, cy, 5, GxEPD_BLACK);
+    display.setTextSize(1);
+    display.setTextColor(GxEPD_BLACK);
+    display.setCursor(cx + 8, cy - 4);
+    display.print("HOME");
+  }
+
+  if (data.count == 0) {
+    if (intersects(cy + 24, cy + 40, page_top, page_bottom)) {
+      draw_centered(display, cx - 130, cy + 24, 260, "NO AIRCRAFT IN RANGE", 2,
+                    GxEPD_BLACK);
+    }
+  }
+
+  const float range_km = data.radius_km > 0 ? data.radius_km : 1.0f;
+  for (uint8_t i = 0; i < data.count; i++) {
+    const AirTrafficAircraft& aircraft = data.aircraft[i];
+    float distance = radius * (float)aircraft.distance_km / range_km;
+    if (distance < 0) distance = 0;
+    if (distance > radius) distance = radius;
+    const float rad = aircraft.bearing_deg * PI / 180.0f;
+    const int16_t x = cx + (int16_t)lroundf(sinf(rad) * distance);
+    const int16_t y = cy - (int16_t)lroundf(cosf(rad) * distance);
+
+    if (intersects(y - 6, y + 7, page_top, page_bottom)) {
+      display.fillCircle(x, y, 6, GxEPD_WHITE);
+      const int16_t heading =
+          aircraft.heading_deg >= 0 ? aircraft.heading_deg
+                                    : aircraft.bearing_deg;
+      draw_plane_symbol(display, x, y, heading, GxEPD_RED);
+    }
+
+    char label[12];
+    snprintf(label, sizeof(label), "%s", aircraft.callsign);
+    const int16_t label_w = text_width(label, 1);
+    int16_t label_x = x + 8;
+    if (label_x + label_w > cx + radius) label_x = x - 8 - label_w;
+    if (label_x < cx - radius) label_x = x + 8;
+    int16_t label_y = y - 4;
+    if (label_y < kBodyTop + 2) label_y = y + 8;
+    if (intersects(label_y, label_y + 8, page_top, page_bottom)) {
+      display.fillRect(label_x - 1, label_y - 1, label_w + 2, 10, GxEPD_WHITE);
+      display.setTextSize(1);
+      display.setTextColor(GxEPD_BLACK);
+      display.setCursor(label_x, label_y);
+      display.print(label);
+    }
+  }
+
+  if (intersects(kBodyBottom - 12, kBodyBottom, page_top, page_bottom)) {
+    char center_text[40];
+    snprintf(center_text, sizeof(center_text), "CENTRE %.4f, %.4f", data.lat,
+             data.lon);
+    display.setTextSize(1);
+    display.setTextColor(GxEPD_BLACK);
+    display.setCursor(18, kBodyBottom - 10);
+    display.print(center_text);
+
+    char range_text[24];
+    snprintf(range_text, sizeof(range_text), "RANGE %.0f KM", data.radius_km);
+    draw_right(display, epd::kWidth - 18, kBodyBottom - 10, range_text, 1,
+               GxEPD_BLACK);
+  }
+}
+
+const uint16_t kMapColors[4] = {GxEPD_WHITE, GxEPD_BLUE, GxEPD_GREEN,
+                                GxEPD_BLACK};
+
+uint8_t map_pixel(int16_t x, int16_t y) {
+  const uint8_t packed = g_map_pixels[(size_t)y * kMapRowBytes + (x >> 2)];
+  return (uint8_t)((packed >> ((x & 3) * 2)) & 3);
+}
+
+void draw_map_label(epd::Display& display, int16_t x, int16_t y,
+                    const char* text, uint8_t size) {
+  const int16_t width = text_width(text, size);
+  display.fillRect(x - 2, y - 1, width + 4, 8 * size + 2, GxEPD_WHITE);
+  display.setTextSize(size);
+  display.setTextColor(GxEPD_BLACK);
+  display.setCursor(x, y);
+  display.print(text);
+}
+
+void draw_real_map_background(epd::Display& display, int16_t page_top,
+                              int16_t page_bottom) {
+  int16_t first = page_top < kMapOffsetY ? kMapOffsetY : page_top;
+  int16_t last = page_bottom > kMapDisplayH ? kMapDisplayH : page_bottom;
+  for (int16_t y = first; y < last; y++) {
+    const int16_t sy =
+        (int16_t)(((int32_t)(y - kMapOffsetY) * kMapImageH) / kMapDisplayH);
+    if (sy < 0 || sy >= kMapImageH) continue;
+
+    int16_t x = 0;
+    while (x < kMapDisplayW) {
+      const int16_t sx =
+          (int16_t)(((int32_t)x * kMapImageW) / kMapDisplayW);
+      const uint8_t index = map_pixel(sx, sy);
+      int16_t run = 1;
+      while (x + run < kMapDisplayW) {
+        const int16_t next_sx =
+            (int16_t)(((int32_t)(x + run) * kMapImageW) / kMapDisplayW);
+        if (map_pixel(next_sx, sy) != index) break;
+        run++;
+      }
+      display.drawFastHLine(x, y, run, kMapColors[index]);
+      x = (int16_t)(x + run);
+    }
+  }
+}
+
+void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
+                           int16_t page_top, int16_t page_bottom) {
+  const float px_per_km =
+      g_map_m_per_px > 0 ? 1000.0f / g_map_m_per_px : 1.0f;
+  const int16_t cx = kMapCenterX;
+  const int16_t cy = kMapCenterY;
+
+  if (intersects(cy - 8, cy + 12, page_top, page_bottom)) {
+    display.fillCircle(cx, cy, 5, GxEPD_WHITE);
+    display.drawCircle(cx, cy, 6, GxEPD_BLACK);
+    display.fillCircle(cx, cy, 3, GxEPD_RED);
+    draw_map_label(display, cx + 9, cy - 4, "HOME", 1);
+  }
+
+  // Keep north visible below the header bar.
+  draw_map_label(display, cx - 6, 36, "N", 2);
+
+  if (data.count == 0 && intersects(cy + 28, cy + 48, page_top,
+                                    page_bottom)) {
+    const char* text = "NO AIRCRAFT IN RANGE";
+    draw_map_label(display, cx - text_width(text, 2) / 2, cy + 28, text, 2);
+  }
+
+  for (uint8_t i = 0; i < data.count; i++) {
+    const AirTrafficAircraft& aircraft = data.aircraft[i];
+    const float angle = aircraft.bearing_deg * PI / 180.0f;
+    int16_t x = cx + (int16_t)lroundf(sinf(angle) * aircraft.distance_km *
+                                      px_per_km);
+    int16_t y = cy - (int16_t)lroundf(cosf(angle) * aircraft.distance_km *
+                                      px_per_km);
+    if (x < 8) x = 8;
+    if (x > kMapDisplayW - 8) x = kMapDisplayW - 8;
+    if (y < 38) y = 38;
+    if (y > 474) y = 474;
+
+    if (intersects(y - 6, y + 7, page_top, page_bottom)) {
+      display.fillCircle(x, y, 6, GxEPD_WHITE);
+      const int16_t heading =
+          aircraft.heading_deg >= 0 ? aircraft.heading_deg
+                                    : aircraft.bearing_deg;
+      draw_plane_symbol(display, x, y, heading, GxEPD_RED);
+    }
+
+    char label[12];
+    snprintf(label, sizeof(label), "%s", aircraft.callsign);
+    const int16_t label_w = text_width(label, 1);
+    int16_t label_x = x + 8;
+    if (label_x + label_w > kMapDisplayW - 6) label_x = x - 8 - label_w;
+    if (label_x < 6) label_x = x + 8;
+    int16_t label_y = y - 4;
+    if (label_y < 36) label_y = y + 8;
+    if (intersects(label_y, label_y + 8, page_top, page_bottom)) {
+      draw_map_label(display, label_x, label_y, label, 1);
+    }
+  }
+
+  char center_text[40];
+  snprintf(center_text, sizeof(center_text), "CENTRE %.4f, %.4f", data.lat,
+           data.lon);
+  if (intersects(36, 46, page_top, page_bottom)) {
+    draw_map_label(display, 18, 36, center_text, 1);
+  }
+
+  if (intersects(460, 472, page_top, page_bottom)) {
+    draw_map_label(display, 18, 462, "(c) Esri, HERE, Garmin, OSM", 1);
+    char range_text[24];
+    snprintf(range_text, sizeof(range_text), "RANGE %.0f KM", data.radius_km);
+    draw_map_label(display,
+                   epd::kWidth - 18 - text_width(range_text, 1), 462,
+                   range_text, 1);
+  }
+}
+
+void draw_map_page(epd::Display& display, const AirTrafficData& data,
+                   int16_t page_top, int16_t page_bottom) {
+  if (!g_map_ready || !g_map_pixels) {
+    draw_radar_map(display, data, page_top, page_bottom);
+    return;
+  }
+
+  draw_real_map_background(display, page_top, page_bottom);
+
+  const float radius_f = data.radius_km * 1000.0f / g_map_m_per_px;
+  const int16_t range_radius = (int16_t)lroundf(radius_f);
+  if (range_radius > 8 && range_radius < 300 &&
+      intersects(kMapCenterY - range_radius, kMapCenterY + range_radius + 1,
+                 page_top, page_bottom)) {
+    display.drawCircle(kMapCenterX, kMapCenterY, range_radius, GxEPD_BLACK);
+  }
+
+  draw_real_map_overlay(display, data, page_top, page_bottom);
+}
+#endif
+
 void draw_poster_page(epd::Display& display, uint8_t page) {
   if (!g_traffic) return;
   const AirTrafficData& data = *g_traffic;
@@ -2013,6 +2801,13 @@ void draw_poster_page(epd::Display& display, uint8_t page) {
   int16_t page_bottom = page_top + display.pageHeight();
   if (page_bottom > display.height()) page_bottom = display.height();
 
+#if AIR_TRAFFIC_MODE == 6
+  draw_map_page(display, data, page_top, page_bottom);
+  if (intersects(0, kHeaderRuleY + 2, page_top, page_bottom)) {
+    display.fillRect(0, 0, epd::kWidth, kHeaderRuleY + 2, GxEPD_WHITE);
+    draw_header(display, data);
+  }
+#else
   if (intersects(0, kHeaderRuleY + 2, page_top, page_bottom)) {
     draw_header(display, data);
   }
@@ -2033,10 +2828,30 @@ void draw_poster_page(epd::Display& display, uint8_t page) {
                 page_bottom);
     }
   }
+#endif
 }
 
 void render_traffic(epd::Display& display, const AirTrafficData& data) {
   g_traffic = &data;
+#if AIR_TRAFFIC_MODE == 2
+  if (data.count > 0) {
+    const FlagId flag = flag_for_registration(data.aircraft[0].registration);
+    Serial.printf("[air] flag %s: %s\n", data.aircraft[0].registration,
+                  flag == kFlagNone ? "none" : kFlagNames[flag]);
+    Serial.flush();
+  }
+#endif
+#if AIR_TRAFFIC_MODE == 6
+  Serial.printf("[air] map %.5f, %.5f radius %.0f km, %u aircraft\n", data.lat,
+                data.lon, data.radius_km, (unsigned)data.count);
+  for (uint8_t i = 0; i < data.count; i++) {
+    const AirTrafficAircraft& aircraft = data.aircraft[i];
+    Serial.printf("[air] map %s: %d km / %d deg, heading %d\n",
+                  aircraft.callsign, aircraft.distance_km,
+                  aircraft.bearing_deg, aircraft.heading_deg);
+  }
+  Serial.flush();
+#endif
   display.firstPage();
   uint8_t physical_page = 0;
   do {
@@ -2184,6 +2999,9 @@ void airTrafficRun(epd::Display& display) {
   WiFi.disconnect(true);
   Serial.printf("[air] free heap %u bytes\n", (unsigned)ESP.getFreeHeap());
   Serial.flush();
+#if AIR_TRAFFIC_MODE == 6
+  if (fetched) decode_map_image();
+#endif
   if (fetched) {
     const uint32_t start = millis();
     render_traffic(display, data);

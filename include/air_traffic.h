@@ -14,6 +14,7 @@ struct AirTrafficAircraft {
   int vertical_rate_fpm; // negative = descending
   int distance_km;
   int bearing_deg;
+  int heading_deg;      // ground track from the feed, -1 when unknown
   char route[40];  // "Dublin to Milan" from adsbdb, empty if unknown
   bool ground;
 };

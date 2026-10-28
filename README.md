@@ -111,35 +111,56 @@ The page is a print-style poster rather than a radar:
   Planespotters thumbnails when available, otherwise bundled fallback photos
   for airliners, regional jets, business jets, turboprops, light singles and
   helicopters. One large aircraft when there is only one, two feature rows for
-  two, and a 2x2 grid for three or four.
+  two, a 2x2 grid for three or four, and a 3+2 grid for five.
 - Each card puts the callsign and aircraft model on one line, then the
   altitude with climbing/descending/level and the route or distance/bearing on
-  the next. Ground aircraft are marked `on the ground`.
+  the next. The single-aircraft layout also shows a country flag, the
+  registration/distance and a recent-route column. Ground aircraft are marked
+  `on the ground`.
+- Mode 6 draws a real street map centred on the configured location, with the
+  aircraft plotted at their distance and bearing and oriented by their track.
 - The feed supplies the callsign, type, altitude, vertical rate and position.
-- The header count is the total within the radius; the poster shows the nearest
-  four aircraft.
+- The header count is the total within the radius; the poster shows as many
+  aircraft as the selected display mode allows (four by default).
 
 The layout is inspired by the
 [Overhead](https://github.com/dmellok/tesserae-widget-overhead) widget, but it
 uses no Tesserae server, airline logos or AI paintings.
-Routes are optional: they come from adsbdb for the four displayed aircraft and
+Routes are optional: they come from adsbdb for the displayed aircraft and
 are cached in RTC memory for two hours; when no route is known the line falls
 back to distance/bearing. See [docs/air-traffic.md](docs/air-traffic.md) for the
 data source, portal, layout and limitations.
 
-### Demo mode (layout testing)
+### Display modes (layout testing)
 
-The built-in demo feed renders the sample aircraft from the Overhead reference
-print without using Wi-Fi or adsb.lol:
+`AIR_TRAFFIC_MODE` selects the poster layout at compile time:
+
+| Mode | Layout |
+| --- | --- |
+| `0` (default) | Live feed, up to 4 aircraft |
+| `1` | Built-in demo feed, `AIR_TRAFFIC_DEMO_COUNT` aircraft |
+| `2` | One live aircraft, with flag, registration/distance and recent routes |
+| `3` | Two live aircraft |
+| `4` | Three live aircraft |
+| `5` | Five live aircraft (3 on top, 2 centred below) |
+| `6` | Real street map centred on the configured location and radius |
 
 ```bash
-PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_DEMO=1" pio run -t upload
+PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=2" pio run -t upload
+PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=6" pio run -t upload
+PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=1 -DAIR_TRAFFIC_DEMO_COUNT=5" \
+  pio run -t upload
 ```
 
-Use `-DAIR_TRAFFIC_DEMO_COUNT=1` to `4` to exercise the single-aircraft,
-two-row and 2x2 layouts. The board does not deep-sleep, so press RESET to
-redraw. Flash without the flag to return to the live feed. The sample aircraft
-are in `fill_demo_data()` in `src/air_traffic.cpp`.
+The demo feed renders the sample aircraft from the Overhead reference print
+without using adsb.lol. It may briefly join Wi-Fi to fetch card photos. The
+board does not deep-sleep in demo mode, so press RESET to redraw. Live modes
+fetch the feed and deep-sleep as usual. Mode 6 downloads one ArcGIS street-map
+image per wake and overlays the aircraft; if the map cannot be fetched or
+decoded it falls back to a range-ring radar. Flash without the flag to return
+to mode 0. The legacy `-DAIR_TRAFFIC_DEMO=1` flag is still accepted as an alias
+for mode 1; the sample aircraft are in `fill_demo_data()` in
+`src/air_traffic.cpp`.
 
 ## Refresh timing
 
@@ -178,7 +199,9 @@ include/air_traffic_config.h   Portal, radius, update and layout constants
 src/main.cpp                   Panel init, OTP test modes, air-traffic entry point
 src/air_traffic.cpp            Wi-Fi portal, adsb.lol fetch, poster renderer
 src/fallback_photos.h          RGB332 fallback photos (PROGMEM)
+src/flags.h                    Generated country flags for registrations
 tools/make_fallback_photos.py  Fallback photo cropper/RGB332 packer (Pillow)
+tools/make_flags.py            Flag downloader/quantiser/packer (Pillow)
 tools/dump_otp.py              Serial OTP dump capture (pyserial)
 docs/hardware.md               Board, panel, pinout and assembly
 docs/air-traffic.md            Standalone air-traffic mode and poster layout
