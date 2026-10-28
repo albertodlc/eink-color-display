@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Generate a compact Natural Earth vector map for the air-traffic map mode.
+"""Generate the compact Natural Earth vector map used by map mode.
 
-The map is drawn from 1:50m ocean polygons and land borders. Coordinates are
-stored as int16 hundredths of a degree (0.005 deg resolution), which keeps the
-firmware image small enough for the ESP32 flash and the rendering crisp at
-100 km range.
+The base map uses 1:50m ocean, country borders and rivers, plus 1:10m
+first-order district boundaries and populated places. Coordinates are int16 at
+0.005 degree resolution; long district segments are merged and simplified to
+keep the generated header within the ESP32's 3 MB application partition.
 """
 
 from __future__ import annotations
@@ -22,12 +22,19 @@ SOURCES = {
     "master/geojson/ne_50m_admin_0_boundary_lines_land.geojson",
     "rivers": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/"
     "master/geojson/ne_50m_rivers_lake_centerlines.geojson",
+    "districts": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/"
+    "master/geojson/ne_10m_admin_1_states_provinces_lines.geojson",
+    "district_labels": "https://raw.githubusercontent.com/nvkelso/"
+    "natural-earth-vector/master/geojson/"
+    "ne_10m_admin_1_states_provinces.geojson",
     "places": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/"
-    "master/geojson/ne_50m_populated_places_simple.geojson",
+    "master/geojson/ne_10m_populated_places_simple.geojson",
 }
 
 SCALE = 200  # 0.005 degrees per unit
 SIMPLIFY = 2  # Douglas-Peucker tolerance, also in 0.005 degree units
+DISTRICT_SIMPLIFY = 4
+EUROPE = (-25.0, 34.0, 45.0, 72.0)  # lon min, lat min, lon max, lat max
 
 
 def download(name: str, cache: pathlib.Path) -> dict:
@@ -37,12 +44,14 @@ def download(name: str, cache: pathlib.Path) -> dict:
         request = urllib.request.Request(
             SOURCES[name], headers={"User-Agent": "eink-color-display/1.0"}
         )
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with urllib.request.urlopen(request, timeout=120) as response:
             path.write_bytes(response.read())
     return json.loads(path.read_text())
 
 
 def lines_from_geometry(geometry: dict) -> list[list[list[float]]]:
+    if not geometry:
+        return []
     kind = geometry["type"]
     coordinates = geometry["coordinates"]
     if kind == "LineString":
@@ -53,14 +62,14 @@ def lines_from_geometry(geometry: dict) -> list[list[list[float]]]:
         return coordinates
     if kind == "MultiPolygon":
         return [ring for polygon in coordinates for ring in polygon]
-    raise ValueError(f"unsupported geometry {kind}")
+    return []
 
 
 def quantise(value: float) -> int:
     return max(-32768, min(32767, int(round(value * SCALE))))
 
 
-def simplify(points: list[tuple[int, int]], tolerance: int) -> list[tuple[int, int]]:
+def simplify(points: list[tuple[int, int]], tolerance: float) -> list[tuple[int, int]]:
     if len(points) < 3:
         return points
     keep = [False] * len(points)
@@ -92,41 +101,185 @@ def simplify(points: list[tuple[int, int]], tolerance: int) -> list[tuple[int, i
     return [point for point, selected in zip(points, keep) if selected]
 
 
-def build_table(features: list[dict], points: list[tuple[int, int]],
-                should_simplify: bool = True) -> list[dict]:
-    table = []
+def in_europe(lon: float, lat: float) -> bool:
+    lon_min, lat_min, lon_max, lat_max = EUROPE
+    return lon_min <= lon <= lon_max and lat_min <= lat <= lat_max
+
+
+def merge_segments(segments: list[list[tuple[int, int]]]) -> list[list[tuple[int, int]]]:
+    """Greedily join line strings that share endpoints."""
+    pending = [list(segment) for segment in segments if len(segment) >= 2]
+    merged: list[list[tuple[int, int]]] = []
+    while pending:
+        chain = pending.pop()
+        changed = True
+        while changed:
+            changed = False
+            for index, segment in enumerate(pending):
+                if chain[-1] == segment[0]:
+                    chain += segment[1:]
+                elif chain[-1] == segment[-1]:
+                    chain += list(reversed(segment))[1:]
+                elif chain[0] == segment[-1]:
+                    chain = segment + chain[1:]
+                elif chain[0] == segment[0]:
+                    chain = list(reversed(segment)) + chain[1:]
+                else:
+                    continue
+                pending.pop(index)
+                changed = True
+                break
+        merged.append(chain)
+    return merged
+
+
+def add_table_entry(table: list[dict], points: list[tuple[int, int]],
+                    line: list[tuple[int, int]]) -> None:
+    if len(line) < 2:
+        return
+    offset = len(points)
+    points.extend(line)
+    xs = [point[0] for point in line]
+    ys = [point[1] for point in line]
+    table.append(
+        {
+            "offset": offset,
+            "count": len(line),
+            "min_lon": min(xs),
+            "min_lat": min(ys),
+            "max_lon": max(xs),
+            "max_lat": max(ys),
+        }
+    )
+
+
+def build_table(features: list[dict], points: list[tuple[int, int]]) -> list[dict]:
+    table: list[dict] = []
     for feature in features:
         for line in lines_from_geometry(feature["geometry"]):
             if len(line) < 2:
                 continue
             quantised = [(quantise(lon), quantise(lat)) for lon, lat in line]
-            if should_simplify:
-                simplified = simplify(quantised, SIMPLIFY)
-                if len(simplified) >= 2:
-                    quantised = simplified
-            offset = len(points)
-            points.extend(quantised)
-            xs = [point[0] for point in quantised]
-            ys = [point[1] for point in quantised]
-            table.append(
-                {
-                    "offset": offset,
-                    "count": len(quantised),
-                    "min_lon": min(xs),
-                    "min_lat": min(ys),
-                    "max_lon": max(xs),
-                    "max_lat": max(ys),
-                }
-            )
+            simplified = simplify(quantised, SIMPLIFY)
+            if len(simplified) >= 2:
+                quantised = simplified
+            add_table_entry(table, points, quantised)
     return table
 
 
+def build_district_table(features: list[dict],
+                         points: list[tuple[int, int]]) -> list[dict]:
+    table: list[dict] = []
+    for feature in features:
+        segments = []
+        for line in lines_from_geometry(feature["geometry"]):
+            if len(line) < 2:
+                continue
+            if not any(in_europe(lon, lat) for lon, lat in line):
+                continue
+            quantised = [(quantise(lon), quantise(lat)) for lon, lat in line]
+            simplified = simplify(quantised, DISTRICT_SIMPLIFY)
+            if len(simplified) >= 2:
+                segments.append(simplified)
+        for merged in merge_segments(segments):
+            add_table_entry(table, points, merged)
+    return table
+
+
+def build_places(features: list[dict]) -> list[dict]:
+    places = []
+    for feature in features:
+        geometry = feature.get("geometry")
+        if not geometry or geometry.get("type") != "Point":
+            continue
+        lon, lat = geometry["coordinates"]
+        properties = feature["properties"]
+        name = properties.get("nameascii") or properties.get("name") or ""
+        rank = int(properties.get("scalerank", 99))
+        if not name or rank > 8:
+            continue
+        places.append(
+            {
+                "lon": quantise(lon),
+                "lat": quantise(lat),
+                "rank": rank,
+                "population": int(properties.get("pop_max") or 0),
+                "name": name,
+            }
+        )
+    places.sort(key=lambda place: (place["rank"], -place["population"],
+                                   place["name"]))
+    return places
+
+
+def build_district_labels(features: list[dict]) -> list[dict]:
+    labels = []
+    for feature in features:
+        properties = feature["properties"]
+        lon = properties.get("longitude")
+        lat = properties.get("latitude")
+        if lon is None or lat is None or not in_europe(lon, lat):
+            continue
+        name = (properties.get("name") or properties.get("name_en") or "")
+        if not name:
+            continue
+        labels.append(
+            {
+                "lon": quantise(lon),
+                "lat": quantise(lat),
+                "rank": int(properties.get("labelrank") or 10),
+                "population": 0,
+                "name": name,
+            }
+        )
+    labels.sort(key=lambda label: (label["rank"], label["name"]))
+    return labels
+
+
+def write_polyline_table(lines: list[str], count_name: str, array_name: str,
+                         entries: list[dict]) -> None:
+    lines.extend([
+        f"constexpr uint16_t {count_name} = {len(entries)};",
+        f"const MapPolyline {array_name}[] = {{",
+    ])
+    for entry in entries:
+        lines.append(
+            "    {%d, %d, %d, %d, %d, %d},"
+            % (
+                entry["offset"],
+                entry["count"],
+                entry["min_lon"],
+                entry["min_lat"],
+                entry["max_lon"],
+                entry["max_lat"],
+            )
+        )
+    lines.append("};")
+    lines.append("")
+
+
+def write_place_table(lines: list[str], count_name: str, array_name: str,
+                      entries: list[dict]) -> None:
+    lines.extend([
+        f"constexpr uint16_t {count_name} = {len(entries)};",
+        f"const MapPlace {array_name}[] = {{",
+    ])
+    for entry in entries:
+        lines.append(
+            '    {%d, %d, %d, %s},'
+            % (entry["lon"], entry["lat"], entry["rank"], json.dumps(entry["name"]))
+        )
+    lines.append("};")
+    lines.append("")
+
+
 def write_header(path: pathlib.Path, ocean: list[dict], borders: list[dict],
-                 rivers: list[dict], places: list[dict],
+                 rivers: list[dict], districts: list[dict],
+                 district_labels: list[dict], places: list[dict],
                  points: list[tuple[int, int]]) -> None:
     lines = [
         "// Generated by tools/make_vector_map.py. Do not edit by hand.",
-        "// Natural Earth 1:50m ocean polygons and land borders (public domain).",
+        "// Natural Earth: 1:50m ocean/borders/rivers, 1:10m districts/places.",
         "#pragma once",
         "",
         "#include <stdint.h>",
@@ -140,60 +293,6 @@ def write_header(path: pathlib.Path, ocean: list[dict], borders: list[dict],
         "  int16_t max_lat;",
         "};",
         "",
-        f"constexpr uint16_t kOceanRingCount = {len(ocean)};",
-        "const MapPolyline kOceanRings[] = {",
-    ]
-    for entry in ocean:
-        lines.append(
-            "    {%d, %d, %d, %d, %d, %d},"
-            % (
-                entry["offset"],
-                entry["count"],
-                entry["min_lon"],
-                entry["min_lat"],
-                entry["max_lon"],
-                entry["max_lat"],
-            )
-        )
-    lines += [
-        "};",
-        "",
-        f"constexpr uint16_t kBorderLineCount = {len(borders)};",
-        "const MapPolyline kBorderLines[] = {",
-    ]
-    for entry in borders:
-        lines.append(
-            "    {%d, %d, %d, %d, %d, %d},"
-            % (
-                entry["offset"],
-                entry["count"],
-                entry["min_lon"],
-                entry["min_lat"],
-                entry["max_lon"],
-                entry["max_lat"],
-            )
-        )
-    lines += [
-        "};",
-        "",
-        f"constexpr uint16_t kRiverLineCount = {len(rivers)};",
-        "const MapPolyline kRiverLines[] = {",
-    ]
-    for entry in rivers:
-        lines.append(
-            "    {%d, %d, %d, %d, %d, %d},"
-            % (
-                entry["offset"],
-                entry["count"],
-                entry["min_lon"],
-                entry["min_lat"],
-                entry["max_lon"],
-                entry["max_lat"],
-            )
-        )
-    lines += [
-        "};",
-        "",
         "struct MapPlace {",
         "  int16_t lon;",
         "  int16_t lat;",
@@ -201,29 +300,29 @@ def write_header(path: pathlib.Path, ocean: list[dict], borders: list[dict],
         "  const char* name;",
         "};",
         "",
-        f"constexpr uint16_t kMapPlaceCount = {len(places)};",
-        "const MapPlace kMapPlaces[] = {",
     ]
-    for place in places:
-        lines.append(
-            '    {%d, %d, %d, %s},'
-            % (place["lon"], place["lat"], place["rank"], json.dumps(place["name"]))
-        )
-    lines += [
-        "};",
-        "",
+    write_polyline_table(lines, "kOceanRingCount", "kOceanRings", ocean)
+    write_polyline_table(lines, "kBorderLineCount", "kBorderLines", borders)
+    write_polyline_table(lines, "kRiverLineCount", "kRiverLines", rivers)
+    write_polyline_table(lines, "kDistrictLineCount", "kDistrictLines", districts)
+    write_place_table(lines, "kDistrictLabelCount", "kDistrictLabels",
+                      district_labels)
+    write_place_table(lines, "kMapPlaceCount", "kMapPlaces", places)
+    lines.extend([
         f"constexpr uint32_t kVectorMapPointCount = {len(points)};",
         "const int16_t kVectorMapPoints[] = {",
-    ]
+    ])
     for start in range(0, len(points), 8):
         chunk = ", ".join(f"{lon},{lat}" for lon, lat in points[start : start + 8])
         lines.append(f"    {chunk},")
-    lines += ["};", ""]
+    lines.append("};")
+    lines.append("")
     path.write_text("\n".join(lines))
     print(
         f"wrote {path}: {len(ocean)} ocean rings, {len(borders)} border lines, "
-        f"{len(rivers)} rivers, {len(places)} places, {len(points)} points, "
-        f"{len(points) * 4} bytes of coordinates"
+        f"{len(rivers)} rivers, {len(districts)} district lines, "
+        f"{len(district_labels)} district labels, {len(places)} places, "
+        f"{len(points)} points ({len(points) * 4} coordinate bytes)"
     )
 
 
@@ -242,30 +341,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    ocean_features = download("ocean", args.cache)["features"]
-    border_features = download("borders", args.cache)["features"]
-    river_features = download("rivers", args.cache)["features"]
-    place_features = download("places", args.cache)["features"]
     points: list[tuple[int, int]] = []
-    ocean = build_table(ocean_features, points)
-    borders = build_table(border_features, points)
-    rivers = build_table(river_features, points)
-    places = []
-    for feature in place_features:
-        lon, lat = feature["geometry"]["coordinates"]
-        properties = feature["properties"]
-        name = properties.get("nameascii") or properties.get("name") or ""
-        if not name:
-            continue
-        places.append(
-            {
-                "lon": quantise(lon),
-                "lat": quantise(lat),
-                "rank": int(properties.get("scalerank", 99)),
-                "name": name,
-            }
-        )
-    write_header(args.output, ocean, borders, rivers, places, points)
+    ocean = build_table(download("ocean", args.cache)["features"], points)
+    borders = build_table(download("borders", args.cache)["features"], points)
+    rivers = build_table(download("rivers", args.cache)["features"], points)
+    districts = build_district_table(download("districts", args.cache)["features"],
+                                     points)
+    district_labels = build_district_labels(
+        download("district_labels", args.cache)["features"]
+    )
+    places = build_places(download("places", args.cache)["features"])
+
+    write_header(args.output, ocean, borders, rivers, districts,
+                 district_labels, places, points)
 
 
 if __name__ == "__main__":

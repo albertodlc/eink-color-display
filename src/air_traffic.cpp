@@ -2588,7 +2588,7 @@ void fill_ocean() {
 void draw_map_places() {
   for (uint16_t i = 0; i < kMapPlaceCount; i++) {
     const MapPlace& place = kMapPlaces[i];
-    if (place.rank > 5) continue;
+    if (place.rank > 8) continue;
     if (place.lon < g_q_lon_min || place.lon > g_q_lon_max ||
         place.lat < g_q_lat_min || place.lat > g_q_lat_max) {
       continue;
@@ -2640,8 +2640,10 @@ bool prepare_vector_map(const AirTrafficData& data) {
   memset(g_map_pixels, 0, kMapBytes);
   const uint32_t started = millis();
   fill_ocean();
+  // District boundaries first, then country borders and coastlines on top.
+  draw_polyline_table(kDistrictLines, kDistrictLineCount, 2);
+  draw_polyline_table(kBorderLines, kBorderLineCount, 3);
   draw_polyline_table(kOceanRings, kOceanRingCount, 3);
-  draw_polyline_table(kBorderLines, kBorderLineCount, 2);
   draw_polyline_table(kRiverLines, kRiverLineCount, 1);
   draw_map_places();
   g_map_ready = true;
@@ -2653,14 +2655,19 @@ bool prepare_vector_map(const AirTrafficData& data) {
   return true;
 }
 
-void draw_map_label(epd::Display& display, int16_t x, int16_t y,
-                    const char* text, uint8_t size) {
+void draw_map_label_color(epd::Display& display, int16_t x, int16_t y,
+                          const char* text, uint8_t size, uint16_t color) {
   const int16_t width = text_width(text, size);
   display.fillRect(x - 2, y - 1, width + 4, 8 * size + 2, GxEPD_WHITE);
   display.setTextSize(size);
-  display.setTextColor(GxEPD_BLACK);
+  display.setTextColor(color);
   display.setCursor(x, y);
   display.print(text);
+}
+
+void draw_map_label(epd::Display& display, int16_t x, int16_t y,
+                    const char* text, uint8_t size) {
+  draw_map_label_color(display, x, y, text, size, GxEPD_BLACK);
 }
 
 void draw_real_map_background(epd::Display& display, int16_t page_top,
@@ -2716,13 +2723,45 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
 
   draw_map_label(display, cx - 6, 36, "N", 2);
 
-  // A small set of city names from Natural Earth, never labels from a raster
-  // tile service. Skip labels that would overlap an earlier one.
-  MapLabelRect used[16];
+  // District names in green, then city names in black. Only labels that fit
+  // without overlapping an earlier one are drawn.
+  MapLabelRect used[24];
   uint8_t used_count = 0;
-  for (uint16_t i = 0; i < kMapPlaceCount && used_count < 8; i++) {
+
+  uint8_t district_labels = 0;
+  for (uint16_t i = 0; i < kDistrictLabelCount && district_labels < 8; i++) {
+    const MapPlace& district = kDistrictLabels[i];
+    if (district.rank > 5) continue;
+    if (district.lon < g_q_lon_min || district.lon > g_q_lon_max ||
+        district.lat < g_q_lat_min || district.lat > g_q_lat_max) {
+      continue;
+    }
+    const int16_t x = (int16_t)map_project_x(district.lon);
+    const int16_t y = (int16_t)map_project_y(district.lat);
+    if (x < 8 || x > kMapDisplayW - 8 || y < 38 || y > 458) continue;
+    const int16_t width = text_width(district.name, 1);
+    int16_t label_x = x - width / 2;
+    if (label_x < 6) label_x = 6;
+    if (label_x + width > kMapDisplayW - 6) {
+      label_x = kMapDisplayW - 6 - width;
+    }
+    const int16_t label_y = y - 4;
+    if (label_overlaps(used, used_count, label_x - 1, label_y - 1,
+                       width + 2, 10)) {
+      continue;
+    }
+    if (intersects(label_y, label_y + 8, page_top, page_bottom)) {
+      draw_map_label_color(display, label_x, label_y, district.name, 1,
+                           GxEPD_GREEN);
+    }
+    used[used_count++] = {label_x - 1, label_y - 1, (int16_t)(width + 2), 10};
+    district_labels++;
+  }
+
+  uint8_t city_labels = 0;
+  for (uint16_t i = 0; i < kMapPlaceCount && city_labels < 10; i++) {
     const MapPlace& place = kMapPlaces[i];
-    if (place.rank > 5) continue;
+    if (place.rank > 8) continue;
     if (place.lon < g_q_lon_min || place.lon > g_q_lon_max ||
         place.lat < g_q_lat_min || place.lat > g_q_lat_max) {
       continue;
@@ -2733,6 +2772,7 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
     const int16_t width = text_width(place.name, 1);
     int16_t label_x = x + 4;
     if (label_x + width > kMapDisplayW - 6) label_x = x - 4 - width;
+    if (label_x < 6) label_x = 6;
     const int16_t label_y = y - 4;
     if (label_overlaps(used, used_count, label_x - 1, label_y - 1,
                        width + 2, 10)) {
@@ -2742,6 +2782,7 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
       draw_map_label(display, label_x, label_y, place.name, 1);
     }
     used[used_count++] = {label_x - 1, label_y - 1, (int16_t)(width + 2), 10};
+    city_labels++;
   }
 
   for (uint8_t i = 0; i < data.count; i++) {
@@ -2785,7 +2826,7 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
       if (intersects(label_y, label_y + 8, page_top, page_bottom)) {
         draw_map_label(display, label_x, label_y, label, 1);
       }
-      if (used_count < 16) {
+      if (used_count < 24) {
         used[used_count++] = {label_x - 1, label_y - 1,
                               (int16_t)(label_w + 2), 10};
       }

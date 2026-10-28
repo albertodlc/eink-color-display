@@ -261,8 +261,9 @@ from the Natural Earth 1:50m dataset embedded in the firmware. It makes no map
 HTTP request. The map covers 10% more than the selected radius and has the same
 5:3 aspect as the panel. The firmware draws:
 
-- white land, blue water, black coastlines, green land borders and blue rivers;
-- a small set of major city names from Natural Earth (no tile-service labels);
+- white land, blue water, black coastlines and country borders, green district
+  boundaries, blue rivers and green district names;
+- a larger set of city names from Natural Earth (no tile-service labels);
 - each aircraft at its ADS-B distance and bearing, rotated by its ground track;
 - callsigns on white labels, the home marker, north and `(c) Natural Earth`;
 - the usual `WITHIN ... KM - N AIRCRAFT` header.
@@ -272,10 +273,12 @@ rasterised once per wake into a 96 KB two-bit buffer at 800x480, which takes
 about 8.5 s on the ESP32; the panel refresh still dominates the wake. If the
 buffer cannot be allocated, the panel shows `MAP DATA UNAVAILABLE`.
 
-The source is Natural Earth 1:50m ocean polygons, land borders, rivers and
-populated places (public domain). It is intentionally sparse: no roads, no
-raster tiles and no tile-provider labels. Regenerate `src/vector_map.h` with
-`python3 tools/make_vector_map.py`.
+The source is Natural Earth: 1:50m ocean polygons, country borders and rivers,
+plus 1:10m first-order district boundaries, district labels and populated
+places (public domain). District boundaries are included for Europe; the rest
+of the world still has country borders, rivers and city labels. It is
+intentionally sparse: no roads, no raster tiles and no tile-provider labels.
+Regenerate `src/vector_map.h` with `python3 tools/make_vector_map.py`.
 
 ## Partition and dependencies
 
@@ -372,10 +375,11 @@ map download and no JPEG decode, so no PSRAM is required.
   second API dependency and up to five HTTPS requests per wake; the RTC cache
   reduces repeat queries. Distance/bearing is always shown when no route is
   available.
-- Map mode uses Natural Earth 1:50m vector data and draws only coastlines,
-  borders, rivers and major city names. It deliberately omits roads and raster
-  tile labels, so it is cleaner but less detailed than a street map. The 96 KB
-  map buffer is allocated after Wi-Fi is disconnected; if that fails the panel
+- Map mode uses Natural Earth 1:50m base data and 1:10m district boundaries and
+  places. It draws coastlines, country and district borders, rivers, district
+  names and major city names. It deliberately omits roads and raster tile
+  labels, so it is cleaner but less detailed than a street map. The 96 KB map
+  buffer is allocated after Wi-Fi is disconnected; if that fails the panel
   shows `MAP DATA UNAVAILABLE`.
 - TLS certificate verification is disabled (`setInsecure()`) because the
   firmware does not ship a CA bundle. The feed is public and read-only, but a
