@@ -65,8 +65,12 @@ constexpr int16_t kMapDisplayH = epd::kHeight;
 constexpr int16_t kMapCenterX = kMapDisplayW / 2;
 constexpr int16_t kMapCenterY = 256;
 constexpr int16_t kMapOffsetY = 16;
-constexpr uint16_t kMapRowBytes = kMapDisplayW / 4;
-constexpr uint32_t kMapBytes = (uint32_t)kMapRowBytes * kMapDisplayH;
+// The background is rendered at 600x360 (54 KB) to keep a large contiguous
+// allocation safe after Wi-Fi/TLS fragmentation, then scaled to 800x480.
+constexpr int16_t kMapBufferW = 600;
+constexpr int16_t kMapBufferH = 360;
+constexpr uint16_t kMapRowBytes = kMapBufferW / 4;
+constexpr uint32_t kMapBytes = (uint32_t)kMapRowBytes * kMapBufferH;
 constexpr int16_t kMapQuantum = 200;  // 0.005 deg, matches the generator
 
 uint8_t* g_map_pixels = nullptr;
@@ -2569,14 +2573,14 @@ void draw_plane_symbol(epd::Display& display, int16_t x, int16_t y,
   const float wx = cosf(rad);
   const float wy = sinf(rad);
 
-  const int16_t nose_x = x + (int16_t)lroundf(fx * 7);
-  const int16_t nose_y = y + (int16_t)lroundf(fy * 7);
-  const int16_t tail_x = x - (int16_t)lroundf(fx * 5);
-  const int16_t tail_y = y - (int16_t)lroundf(fy * 5);
-  const int16_t wing1_x = x + (int16_t)lroundf(wx * 4 - fx);
-  const int16_t wing1_y = y + (int16_t)lroundf(wy * 4 - fy);
-  const int16_t wing2_x = x - (int16_t)lroundf(wx * 4 + fx);
-  const int16_t wing2_y = y - (int16_t)lroundf(wy * 4 + fy);
+  const int16_t nose_x = x + (int16_t)lroundf(fx * 8);
+  const int16_t nose_y = y + (int16_t)lroundf(fy * 8);
+  const int16_t tail_x = x - (int16_t)lroundf(fx * 6);
+  const int16_t tail_y = y - (int16_t)lroundf(fy * 6);
+  const int16_t wing1_x = x + (int16_t)lroundf(wx * 5 - fx);
+  const int16_t wing1_y = y + (int16_t)lroundf(wy * 5 - fy);
+  const int16_t wing2_x = x - (int16_t)lroundf(wx * 5 + fx);
+  const int16_t wing2_y = y - (int16_t)lroundf(wy * 5 + fy);
 
   display.drawLine(tail_x, tail_y, nose_x, nose_y, color);
   display.drawLine(wing1_x, wing1_y, wing2_x, wing2_y, color);
@@ -2593,8 +2597,7 @@ uint8_t map_pixel(int16_t x, int16_t y) {
 }
 
 void map_set_pixel(int16_t x, int16_t y, uint8_t index) {
-  if (x < 0 || x >= kMapDisplayW || y < kMapOffsetY ||
-      y >= kMapDisplayH) {
+  if (x < 0 || x >= kMapBufferW || y < 0 || y >= kMapBufferH) {
     return;
   }
   const size_t byte = (size_t)y * kMapRowBytes + (x >> 2);
@@ -2610,7 +2613,7 @@ void map_fill_span(int16_t y, int16_t x0, int16_t x1, uint8_t index) {
     x1 = swap;
   }
   if (x0 < 0) x0 = 0;
-  if (x1 >= kMapDisplayW) x1 = kMapDisplayW - 1;
+  if (x1 >= kMapBufferW) x1 = kMapBufferW - 1;
   for (int16_t x = x0; x <= x1; x++) {
     map_set_pixel(x, y, index);
   }
@@ -2666,14 +2669,16 @@ bool clip_line(int32_t& x0, int32_t& y0, int32_t& x1, int32_t& y1,
 }
 
 void map_draw_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
-                   uint8_t index) {
+                   uint8_t index, bool dotted = false) {
   const int16_t dx = (int16_t)abs(x1 - x0);
   const int16_t sx = x0 < x1 ? 1 : -1;
   const int16_t dy = (int16_t)-abs(y1 - y0);
   const int16_t sy = y0 < y1 ? 1 : -1;
   int16_t err = (int16_t)(dx + dy);
   for (;;) {
-    map_set_pixel(x0, y0, index);
+    if (!dotted || ((x0 + y0) & 1) == 0) {
+      map_set_pixel(x0, y0, index);
+    }
     if (x0 == x1 && y0 == y1) break;
     const int16_t e2 = (int16_t)(2 * err);
     if (e2 >= dy) {
@@ -2688,13 +2693,23 @@ void map_draw_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1,
 }
 
 int32_t map_project_x(int16_t q_lon) {
-  return (int32_t)(q_lon - g_q_lon_min) * kMapDisplayW /
+  return (int32_t)(q_lon - g_q_lon_min) * kMapBufferW /
          (g_q_lon_max - g_q_lon_min);
 }
 
 int32_t map_project_y(int16_t q_lat) {
+  return (int32_t)(g_q_lat_max - q_lat) * kMapBufferH /
+         (g_q_lat_max - g_q_lat_min);
+}
+
+int32_t map_display_x(int16_t q_lon) {
+  return (int32_t)(q_lon - g_q_lon_min) * kMapDisplayW /
+         (g_q_lon_max - g_q_lon_min);
+}
+
+int32_t map_display_y(int16_t q_lat) {
   return kMapOffsetY + (int32_t)(g_q_lat_max - q_lat) * kMapDisplayH /
-                           (g_q_lat_max - g_q_lat_min);
+         (g_q_lat_max - g_q_lat_min);
 }
 
 bool polyline_visible(const MapPolyline& line) {
@@ -2703,7 +2718,7 @@ bool polyline_visible(const MapPolyline& line) {
 }
 
 void draw_polyline_table(const MapPolyline* table, uint16_t count,
-                         uint8_t color) {
+                         uint8_t color, bool dotted = false) {
   for (uint16_t i = 0; i < count; i++) {
     const MapPolyline& line = table[i];
     if (!polyline_visible(line)) continue;
@@ -2717,10 +2732,10 @@ void draw_polyline_table(const MapPolyline* table, uint16_t count,
       int32_t y0 = previous_y;
       int32_t x1 = x;
       int32_t y1 = y;
-      if (clip_line(x0, y0, x1, y1, 0, kMapOffsetY, kMapDisplayW - 1,
-                    kMapDisplayH - 1)) {
+      if (clip_line(x0, y0, x1, y1, 0, 0, kMapBufferW - 1,
+                    kMapBufferH - 1)) {
         map_draw_line((int16_t)x0, (int16_t)y0, (int16_t)x1, (int16_t)y1,
-                      color);
+                      color, dotted);
       }
       previous_x = x;
       previous_y = y;
@@ -2733,10 +2748,10 @@ void fill_ocean() {
   const int32_t lat_span = g_q_lat_max - g_q_lat_min;
   if (lon_span <= 0 || lat_span <= 0) return;
 
-  for (int16_t y = kMapOffsetY; y < kMapDisplayH; y++) {
+  for (int16_t y = 0; y < kMapBufferH; y++) {
     const float q_lat =
         (float)g_q_lat_max -
-        ((float)(y - kMapOffsetY) + 0.5f) * (float)lat_span / kMapDisplayH;
+        ((float)y + 0.5f) * (float)lat_span / kMapBufferH;
     int32_t intersections[512];
     uint16_t found = 0;
 
@@ -2758,7 +2773,7 @@ void fill_ocean() {
           const float lon = (float)lon1 + t * (float)(lon2 - lon1);
           const int32_t x =
               (int32_t)lroundf((lon - (float)g_q_lon_min) *
-                               (float)kMapDisplayW / (float)lon_span);
+                               (float)kMapBufferW / (float)lon_span);
           if (found < 512) intersections[found++] = x;
         }
       }
@@ -2770,9 +2785,9 @@ void fill_ocean() {
       int32_t left = intersections[i];
       int32_t right = intersections[i + 1];
       if (left < -1) left = -1;
-      if (left > kMapDisplayW) left = kMapDisplayW;
+      if (left > kMapBufferW) left = kMapBufferW;
       if (right < -1) right = -1;
-      if (right > kMapDisplayW) right = kMapDisplayW;
+      if (right > kMapBufferW) right = kMapBufferW;
       map_fill_span(y, (int16_t)left, (int16_t)right, 1);
     }
   }
@@ -2788,8 +2803,7 @@ void draw_map_places() {
     }
     const int32_t x = map_project_x(place.lon);
     const int32_t y = map_project_y(place.lat);
-    if (x < 2 || x >= kMapDisplayW - 2 || y < kMapOffsetY + 2 ||
-        y >= kMapDisplayH - 2) {
+    if (x < 2 || x >= kMapBufferW - 2 || y < 2 || y >= kMapBufferH - 2) {
       continue;
     }
     map_fill_span((int16_t)y, (int16_t)(x - 1), (int16_t)(x + 1), 3);
@@ -2837,7 +2851,7 @@ bool prepare_vector_map(const AirTrafficData& data) {
   draw_polyline_table(kDistrictLines, kDistrictLineCount, 2);
   draw_polyline_table(kBorderLines, kBorderLineCount, 3);
   draw_polyline_table(kOceanRings, kOceanRingCount, 3);
-  draw_polyline_table(kRiverLines, kRiverLineCount, 1);
+  draw_polyline_table(kRiverLines, kRiverLineCount, 1, true);
   draw_map_places();
   g_map_ready = true;
   Serial.printf("[air] vector map q=%ld..%ld, %ld..%ld in %lu ms, heap %u\n",
@@ -2863,18 +2877,59 @@ void draw_map_label(epd::Display& display, int16_t x, int16_t y,
   draw_map_label_color(display, x, y, text, size, GxEPD_BLACK);
 }
 
+void draw_small_flag(epd::Display& display, FlagId flag, int16_t x,
+                     int16_t y) {
+  if (flag == kFlagNone || flag >= kFlagCount) return;
+  display.drawRect(x, y, 16, 11, GxEPD_WHITE);
+  for (uint8_t fy = 0; fy < 9; fy++) {
+    const uint8_t sy = (uint8_t)((uint16_t)fy * kFlagHeight / 9);
+    for (uint8_t fx = 0; fx < 14; fx++) {
+      const uint8_t sx = (uint8_t)((uint16_t)fx * kFlagWidth / 14);
+      const uint8_t packed = kFlagData[flag][sy * kFlagRowBytes + (sx >> 1)];
+      const uint8_t index = (sx & 1) ? (uint8_t)(packed >> 4)
+                                     : (uint8_t)(packed & 0x0F);
+      if (index < 6) {
+        display.drawPixel(x + 1 + fx, y + 1 + fy, kPhotoColors[index]);
+      }
+    }
+  }
+}
+
+void draw_aircraft_label(epd::Display& display, int16_t x, int16_t y,
+                         const char* text, FlagId flag) {
+  const bool has_flag = flag != kFlagNone;
+  const int16_t flag_width = has_flag ? 18 : 0;
+  const int16_t label_width = text_width(text, 1);
+  const int16_t total = flag_width + label_width;
+  display.fillRect(x - 2, y - 2, total + 4, 13, GxEPD_BLACK);
+  if (has_flag) draw_small_flag(display, flag, x, y - 1);
+  display.setTextSize(1);
+  display.setTextColor(GxEPD_WHITE);
+  display.setCursor(x + flag_width, y);
+  display.print(text);
+}
+
 void draw_real_map_background(epd::Display& display, int16_t page_top,
                               int16_t page_bottom) {
   const int16_t first = page_top < kMapOffsetY ? kMapOffsetY : page_top;
   const int16_t last =
       page_bottom > kMapDisplayH ? kMapDisplayH : page_bottom;
   for (int16_t y = first; y < last; y++) {
+    const int16_t sy =
+        (int16_t)(((int32_t)(y - kMapOffsetY) * kMapBufferH) /
+                  kMapDisplayH);
+    if (sy < 0 || sy >= kMapBufferH) continue;
+
     int16_t x = 0;
     while (x < kMapDisplayW) {
-      const uint8_t index = map_pixel(x, y);
+      const int16_t sx =
+          (int16_t)(((int32_t)x * kMapBufferW) / kMapDisplayW);
+      const uint8_t index = map_pixel(sx, sy);
       int16_t run = 1;
-      while (x + run < kMapDisplayW &&
-             map_pixel((int16_t)(x + run), y) == index) {
+      while (x + run < kMapDisplayW) {
+        const int16_t next_sx =
+            (int16_t)(((int32_t)(x + run) * kMapBufferW) / kMapDisplayW);
+        if (map_pixel(next_sx, sy) != index) break;
         run++;
       }
       display.drawFastHLine(x, y, run, kMapColors[index]);
@@ -2916,8 +2971,8 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
 
   draw_map_label(display, cx - 6, 36, "N", 2);
 
-  // District names in green, then city names in black. Only labels that fit
-  // without overlapping an earlier one are drawn.
+  // District names are black; city names are deliberately a lower-contrast
+  // green. Aircraft identifiers get their own black labels with flags.
   MapLabelRect used[24];
   uint8_t used_count = 0;
 
@@ -2929,8 +2984,8 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
         district.lat < g_q_lat_min || district.lat > g_q_lat_max) {
       continue;
     }
-    const int16_t x = (int16_t)map_project_x(district.lon);
-    const int16_t y = (int16_t)map_project_y(district.lat);
+    const int16_t x = (int16_t)map_display_x(district.lon);
+    const int16_t y = (int16_t)map_display_y(district.lat);
     if (x < 8 || x > kMapDisplayW - 8 || y < 38 || y > 458) continue;
     const int16_t width = text_width(district.name, 1);
     int16_t label_x = x - width / 2;
@@ -2944,8 +2999,7 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
       continue;
     }
     if (intersects(label_y, label_y + 8, page_top, page_bottom)) {
-      draw_map_label_color(display, label_x, label_y, district.name, 1,
-                           GxEPD_GREEN);
+      draw_map_label(display, label_x, label_y, district.name, 1);
     }
     used[used_count++] = {label_x - 1, label_y - 1, (int16_t)(width + 2), 10};
     district_labels++;
@@ -2959,8 +3013,8 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
         place.lat < g_q_lat_min || place.lat > g_q_lat_max) {
       continue;
     }
-    int16_t x = (int16_t)map_project_x(place.lon);
-    int16_t y = (int16_t)map_project_y(place.lat);
+    int16_t x = (int16_t)map_display_x(place.lon);
+    int16_t y = (int16_t)map_display_y(place.lat);
     if (x < 8 || x > kMapDisplayW - 8 || y < 38 || y > 458) continue;
     const int16_t width = text_width(place.name, 1);
     int16_t label_x = x + 4;
@@ -2972,7 +3026,8 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
       continue;
     }
     if (intersects(label_y, label_y + 8, page_top, page_bottom)) {
-      draw_map_label(display, label_x, label_y, place.name, 1);
+      draw_map_label_color(display, label_x, label_y, place.name, 1,
+                           GxEPD_GREEN);
     }
     used[used_count++] = {label_x - 1, label_y - 1, (int16_t)(width + 2), 10};
     city_labels++;
@@ -2992,6 +3047,7 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
 
     if (intersects(y - 6, y + 7, page_top, page_bottom)) {
       display.fillCircle(x, y, 6, GxEPD_WHITE);
+      display.drawCircle(x, y, 7, GxEPD_BLACK);
       const int16_t heading =
           aircraft.heading_deg >= 0 ? aircraft.heading_deg
                                     : aircraft.bearing_deg;
@@ -3000,28 +3056,30 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
 
     char label[12];
     snprintf(label, sizeof(label), "%s", aircraft.callsign);
-    const int16_t label_w = text_width(label, 1);
-    const int16_t candidate_x[4] = {x + 8, (int16_t)(x - 8 - label_w),
+    const FlagId flag = flag_for_registration(aircraft.registration);
+    const int16_t flag_w = flag != kFlagNone ? 18 : 0;
+    const int16_t label_w = flag_w + text_width(label, 1);
+    const int16_t candidate_x[4] = {x + 10, (int16_t)(x - 10 - label_w),
                                     (int16_t)(x - label_w / 2),
                                     (int16_t)(x - label_w / 2)};
     const int16_t candidate_y[4] = {y - 4, y - 4, y - 14, y + 8};
     for (uint8_t candidate = 0; candidate < 4; candidate++) {
       const int16_t label_x = candidate_x[candidate];
       const int16_t label_y = candidate_y[candidate];
-      if (label_x < 6 || label_x + label_w > kMapDisplayW - 6 ||
-          label_y < 36 || label_y > 466) {
+      if (label_x < 4 || label_x + label_w > kMapDisplayW - 4 ||
+          label_y < 38 || label_y > 466) {
         continue;
       }
-      if (label_overlaps(used, used_count, label_x - 1, label_y - 1,
-                         label_w + 2, 10)) {
+      if (label_overlaps(used, used_count, label_x - 2, label_y - 2,
+                         label_w + 4, 13)) {
         continue;
       }
-      if (intersects(label_y, label_y + 8, page_top, page_bottom)) {
-        draw_map_label(display, label_x, label_y, label, 1);
+      if (intersects(label_y - 2, label_y + 11, page_top, page_bottom)) {
+        draw_aircraft_label(display, label_x, label_y, label, flag);
       }
       if (used_count < 24) {
-        used[used_count++] = {label_x - 1, label_y - 1,
-                              (int16_t)(label_w + 2), 10};
+        used[used_count++] = {label_x - 2, label_y - 2,
+                              (int16_t)(label_w + 4), 13};
       }
       break;
     }

@@ -272,16 +272,19 @@ HTTP request. The map covers 10% more than the selected radius and has the same
 5:3 aspect as the panel. The firmware draws:
 
 - white land, blue water, black coastlines and country borders, green district
-  boundaries, blue rivers and green district names;
-- a larger set of city names from Natural Earth (no tile-service labels);
+  boundaries, dotted blue rivers and black district names;
+- city names in a lower-contrast green, with district and city labels
+  collision-filtered;
 - each aircraft at its ADS-B distance and bearing, rotated by its ground track;
-- callsigns on white labels, the home marker, north and `(c) Natural Earth`;
+- aircraft callsigns on black labels with white text and a small country flag;
+- the home marker, north and `(c) Natural Earth`;
 - the usual `WITHIN ... KM - N AIRCRAFT` header.
 
 There is no range circle or other legend over the map. The vector image is
-rasterised once per wake into a 96 KB two-bit buffer at 800x480, which takes
-about 8.5 s on the ESP32; the panel refresh still dominates the wake. If the
-buffer cannot be allocated, the panel shows `MAP DATA UNAVAILABLE`.
+rasterised once per wake into a 54 KB two-bit buffer at 600x360, scaled to the
+800x480 panel, which takes about 6.7 s on the ESP32; the panel refresh still
+dominates the wake. If the buffer cannot be allocated, the panel shows
+`MAP DATA UNAVAILABLE`.
 
 The source is Natural Earth: 1:50m ocean polygons, country borders and rivers,
 plus 1:10m first-order district boundaries, district labels and populated
@@ -367,12 +370,13 @@ Map mode rasterises the embedded Natural Earth vectors after Wi-Fi is
 disconnected:
 
 ```text
-[air] vector map q=-1035..-130, 8463..8858 in 8495 ms, heap 84940
+[air] vector map q=-1035..-130, 8463..8858 in 6656 ms, heap 127748
 [air] render total 37123 ms (panel 26023 ms)
 ```
 
-The background is an 800x480 two-bit buffer (96 KB) with four inks. There is no
-map download and no JPEG decode, so no PSRAM is required.
+The background is a 600x360 two-bit buffer (54 KB) with four inks, scaled to
+the 800x480 panel. There is no map download and no JPEG decode, so no PSRAM is
+required.
 
 ## Limitations
 
@@ -387,10 +391,11 @@ map download and no JPEG decode, so no PSRAM is required.
   available.
 - Map mode uses Natural Earth 1:50m base data and 1:10m district boundaries and
   places. It draws coastlines, country and district borders, rivers, district
-  names and major city names. It deliberately omits roads and raster tile
-  labels, so it is cleaner but less detailed than a street map. The 96 KB map
-  buffer is allocated after Wi-Fi is disconnected; if that fails the panel
-  shows `MAP DATA UNAVAILABLE`.
+  names and major city names. City names use a lower-contrast green; aircraft
+  identifiers use black labels, white text and country flags. It deliberately
+  omits roads and raster tile labels, so it is cleaner but less detailed than a
+  street map. The 54 KB map buffer is allocated after Wi-Fi is disconnected; if
+  that fails the panel shows `MAP DATA UNAVAILABLE`.
 - TLS certificate verification is disabled (`setInsecure()`) because the
   firmware does not ship a CA bundle. The feed is public and read-only, but a
   man-in-the-middle could alter the displayed data. The public image proxy
