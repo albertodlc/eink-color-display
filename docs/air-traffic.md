@@ -174,9 +174,13 @@ regional jet (E190), turboprop (ATR 72/Dash 8), business jet (Citation CJ3),
 light single (Cessna 172) and helicopter (AW139). Sources and licences are in
 [`assets/aircraft/ATTRIBUTION.md`](../assets/aircraft/ATTRIBUTION.md). Live
 thumbnails are decoded at 320x128, expanded from RGB565 to 8-bit channels with
-bit replication, and mapped to the six inks. The bundled fallbacks are stored as
-smooth 480x192 RGB332 data and Floyd-Steinberg dithered at the final card
-resolution.
+bit replication, and mapped to the six inks. Neutral tones are mapped to
+black/white instead of green/yellow, which the panel cannot represent as gray.
+Grid cards keep a 3-bit packed bitmap with light colour dithering. The
+single-aircraft view keeps the live image as RGB332 and uses Floyd-Steinberg at
+the final card resolution, so the large image has smoother tone and avoids an
+upscaled checkerboard. The bundled fallbacks are stored as smooth 480x192
+RGB332 data and Floyd-Steinberg dithered at the final card resolution.
 
 ### Character set
 

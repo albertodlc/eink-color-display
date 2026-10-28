@@ -646,6 +646,15 @@ void resolve_route(AirTrafficAircraft& aircraft, uint32_t now) {
 }
 
 uint8_t photo_nearest_index(uint8_t r, uint8_t g, uint8_t b) {
+  // Neutral tones must become black/white, not green or yellow. The panel has
+  // no gray ink; Floyd-Steinberg or the caller's ordered dither supplies it.
+  const uint8_t mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+  const uint8_t mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+  if ((uint8_t)(mx - mn) < 36) {
+    const uint8_t luminance = (uint8_t)((r * 3 + g * 4 + b * 2) / 9);
+    return luminance >= 128 ? 1 : 0;
+  }
+
   uint8_t best = 1;
   uint32_t best_distance = 0xFFFFFFFFu;
   for (uint8_t i = 0; i < 6; i++) {
@@ -664,8 +673,16 @@ uint8_t photo_nearest_index(uint8_t r, uint8_t g, uint8_t b) {
 
 uint8_t photo_index_dither(uint8_t r, uint8_t g, uint8_t b, int16_t x,
                            int16_t y) {
-  // A light ordered dither at the final display resolution. It is used for the
-  // bundled fallback images, which are stored as smooth RGB332 data.
+  // Neutral tones become black or white. Ordered dithering at the source
+  // resolution is upscaled with the photo and looks like a checkerboard, so
+  // keep neutral areas clean and reserve colour dithering for coloured areas.
+  const uint8_t mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+  const uint8_t mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+  if ((uint8_t)(mx - mn) < 36) {
+    const uint8_t luminance = (uint8_t)((r * 3 + g * 4 + b * 2) / 9);
+    return luminance >= 128 ? 1 : 0;
+  }
+
   static const int8_t kBayer4[4][4] = {
       {-8, 0, -6, 2},
       {4, -4, 6, -2},
@@ -714,6 +731,9 @@ void photo_clear(PhotoCard& photo) {
 }
 
 PhotoCard* g_active_photo = nullptr;
+uint8_t* g_decode_rgb = nullptr;
+uint8_t* g_feature_photo = nullptr;  // RGB332 320x128 for the large single view
+bool g_feature_valid = false;
 int g_jpeg_out_w = 0;
 int g_jpeg_out_h = 0;
 int g_jpeg_crop_x = 0;
@@ -722,7 +742,7 @@ int g_jpeg_crop_w = 0;
 int g_jpeg_crop_h = 0;
 
 int jpeg_draw_callback(JPEGDRAW* draw) {
-  if (!g_active_photo) return 1;
+  if (!g_active_photo && !g_decode_rgb) return 1;
   for (int yy = 0; yy < draw->iHeight; yy++) {
     const int py = draw->y + yy;
     if (py < g_jpeg_crop_y || py >= g_jpeg_crop_y + g_jpeg_crop_h) continue;
@@ -753,11 +773,21 @@ int jpeg_draw_callback(JPEGDRAW* draw) {
       const uint8_t r = (uint8_t)((r5 << 3) | (r5 >> 2));
       const uint8_t g = (uint8_t)((g6 << 2) | (g6 >> 4));
       const uint8_t b = (uint8_t)((b5 << 3) | (b5 >> 2));
-      const uint8_t index =
-          photo_index_dither(r, g, b, (int16_t)tx0, (int16_t)ty0);
-      for (int ty = ty0; ty <= ty1; ty++) {
-        for (int tx = tx0; tx <= tx1; tx++) {
-          photo_set(*g_active_photo, tx, ty, index);
+      if (g_decode_rgb) {
+        const uint8_t packed =
+            (uint8_t)(((r >> 5) << 5) | ((g >> 5) << 2) | (b >> 6));
+        for (int ty = ty0; ty <= ty1; ty++) {
+          for (int tx = tx0; tx <= tx1; tx++) {
+            g_decode_rgb[(size_t)ty * kPhotoW + tx] = packed;
+          }
+        }
+      } else {
+        const uint8_t index =
+            photo_index_dither(r, g, b, (int16_t)tx0, (int16_t)ty0);
+        for (int ty = ty0; ty <= ty1; ty++) {
+          for (int tx = tx0; tx <= tx1; tx++) {
+            photo_set(*g_active_photo, tx, ty, index);
+          }
         }
       }
     }
@@ -766,7 +796,7 @@ int jpeg_draw_callback(JPEGDRAW* draw) {
 }
 
 bool process_photo(const uint8_t* jpeg_bytes, size_t jpeg_size,
-                   PhotoCard& photo) {
+                   PhotoCard& photo, bool rgb332 = false) {
   if (jpeg_size < 1000) return false;
   Serial.printf("[air] jpeg: %u bytes, %02X %02X\n", (unsigned)jpeg_size,
                 jpeg_bytes[0], jpeg_bytes[1]);
@@ -813,16 +843,27 @@ bool process_photo(const uint8_t* jpeg_bytes, size_t jpeg_size,
     g_jpeg_crop_y = g_jpeg_out_h - g_jpeg_crop_h;
   }
 
-  photo_clear(photo);
-  g_active_photo = &photo;
+  if (rgb332) {
+    if (!g_feature_photo) return false;
+    memset(g_feature_photo, 0xFF, (size_t)kPhotoW * kPhotoH);
+  } else {
+    photo_clear(photo);
+  }
+  g_active_photo = rgb332 ? nullptr : &photo;
+  g_decode_rgb = rgb332 ? g_feature_photo : nullptr;
   const int ok = decoder->decode(0, 0, 0);
   g_active_photo = nullptr;
+  g_decode_rgb = nullptr;
   delete decoder;
   if (!ok) {
     Serial.println("[air] jpeg: decode failed");
     return false;
   }
-  photo.valid = true;
+  if (rgb332) {
+    g_feature_valid = true;
+  } else {
+    photo.valid = true;
+  }
   Serial.printf("[air] jpeg: %dx%d -> %dx%d\n", source_w, source_h,
                 g_jpeg_out_w, g_jpeg_out_h);
   return true;
@@ -1229,6 +1270,10 @@ void fetch_photos(AirTrafficData& data) {
     fetch_flight_history(aircraft, data.feed_time);
   }
 
+  g_feature_valid = false;
+  if (g_mode == 2 && !g_feature_photo) {
+    g_feature_photo = (uint8_t*)malloc((size_t)kPhotoW * kPhotoH);
+  }
   if (!ensure_photo_store()) {
     Serial.printf("[air] photo buffers: allocation failed, heap %u\n",
                   (unsigned)ESP.getFreeHeap());
@@ -1262,7 +1307,9 @@ void fetch_photos(AirTrafficData& data) {
     }
 
     const uint32_t start = millis();
-    const bool decoded = process_photo(jpeg, jpeg_size, *g_photos[i]);
+    const bool use_rgb = (g_mode == 2 && i == 0 && g_feature_photo);
+    const bool decoded =
+        process_photo(jpeg, jpeg_size, *g_photos[i], use_rgb);
     free(jpeg);
     if (!decoded) {
       photo_cache_invalidate(aircraft.registration);
@@ -2536,11 +2583,16 @@ void draw_card(epd::Display& display, const PosterCard& card,
   if (card.index < AIR_TRAFFIC_PAGE_AIRCRAFT) {
     live_photo = g_photos[card.index];
   }
+  const bool feature_photo =
+      g_mode == 2 && g_feature_valid && g_feature_photo;
   const PhotoView photo =
-      (live_photo && live_photo->valid)
-          ? PhotoView{live_photo->pixels, (uint16_t)kPhotoW,
-                      (uint16_t)kPhotoH, PhotoFormat::Packed3}
-          : fallback_photo_for_type(aircraft.type);
+      feature_photo
+          ? PhotoView{g_feature_photo, (uint16_t)kPhotoW,
+                      (uint16_t)kPhotoH, PhotoFormat::Rgb332}
+          : ((live_photo && live_photo->valid)
+                 ? PhotoView{live_photo->pixels, (uint16_t)kPhotoW,
+                             (uint16_t)kPhotoH, PhotoFormat::Packed3}
+                 : fallback_photo_for_type(aircraft.type));
   const FlagId registration_flag =
       flag_for_registration(aircraft.registration);
 
