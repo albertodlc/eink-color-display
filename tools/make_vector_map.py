@@ -13,6 +13,7 @@ import argparse
 import json
 import math
 import pathlib
+import unicodedata
 import urllib.request
 
 SOURCES = {
@@ -35,6 +36,25 @@ SCALE = 200  # 0.005 degrees per unit
 SIMPLIFY = 2  # Douglas-Peucker tolerance, also in 0.005 degree units
 DISTRICT_SIMPLIFY = 4
 EUROPE = (-25.0, 34.0, 45.0, 72.0)  # lon min, lat min, lon max, lat max
+
+SPECIAL_ASCII = {
+    "Æ": "AE", "æ": "ae", "Œ": "OE", "œ": "oe",
+    "Ø": "O", "ø": "o", "Ð": "D", "ð": "d",
+    "Þ": "Th", "þ": "th", "ß": "ss",
+    "Ł": "L", "ł": "l", "Đ": "D", "đ": "d",
+    "İ": "I", "ı": "i", "Ğ": "G", "ğ": "g",
+    "Ş": "S", "ş": "s", "Ŋ": "N", "ŋ": "n",
+    "ſ": "s",
+}
+
+
+def to_ascii(text: str) -> str:
+    expanded = "".join(SPECIAL_ASCII.get(ch, ch) for ch in text)
+    decomposed = unicodedata.normalize("NFKD", expanded)
+    return "".join(
+        ch for ch in decomposed
+        if not unicodedata.combining(ch) and ord(ch) < 128
+    ).strip()
 
 
 def download(name: str, cache: pathlib.Path) -> dict:
@@ -194,7 +214,8 @@ def build_places(features: list[dict]) -> list[dict]:
             continue
         lon, lat = geometry["coordinates"]
         properties = feature["properties"]
-        name = properties.get("nameascii") or properties.get("name") or ""
+        name = to_ascii(properties.get("nameascii") or
+                        properties.get("name") or "")
         rank = int(properties.get("scalerank", 99))
         if not name or rank > 8:
             continue
@@ -220,7 +241,8 @@ def build_district_labels(features: list[dict]) -> list[dict]:
         lat = properties.get("latitude")
         if lon is None or lat is None or not in_europe(lon, lat):
             continue
-        name = (properties.get("name") or properties.get("name_en") or "")
+        name = to_ascii(properties.get("name") or
+                        properties.get("name_en") or "")
         if not name:
             continue
         labels.append(

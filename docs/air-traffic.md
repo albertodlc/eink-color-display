@@ -171,6 +171,16 @@ bit replication, and mapped to the six inks. The bundled fallbacks are stored as
 smooth 480x192 RGB332 data and Floyd-Steinberg dithered at the final card
 resolution.
 
+### Character set
+
+The panel uses the ASCII 5x7 Adafruit font. Natural Earth names in
+`src/vector_map.h` are transliterated when the header is generated, and UTF-8
+route/history names from adsbdb and JetAPI are transliterated at runtime:
+`Nápoli -> Napoli`, `Logroño -> Logrono`, `Álava -> Alava`,
+`San Sebastián -> San Sebastian`, `Zürich -> Zurich`. Non-Latin characters are
+omitted rather than sent to the font as multi-byte sequences, which would draw
+as garbage.
+
 ## Configuration
 
 Compile-time defaults live in `include/air_traffic_config.h`:
