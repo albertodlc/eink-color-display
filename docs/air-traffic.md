@@ -151,8 +151,9 @@ photo for the aircraft family: narrowbody (A320/B737/B757), widebody (A330),
 regional jet (E190), turboprop (ATR 72/Dash 8), business jet (Citation CJ3),
 light single (Cessna 172) and helicopter (AW139). Sources and licences are in
 [`assets/aircraft/ATTRIBUTION.md`](../assets/aircraft/ATTRIBUTION.md). Live
-thumbnails are quantised on the ESP32 with a light ordered dither; the bundled
-fallbacks are pre-dithered with Floyd-Steinberg.
+thumbnails are decoded at 320x128 and mapped to the six inks. The bundled
+fallbacks are stored as smooth 480x192 RGB332 data and Floyd-Steinberg dithered
+at the final card resolution.
 
 ## Configuration
 
@@ -281,17 +282,20 @@ RESET redraws it.
 
 ## Limitations
 
-- Aircraft images are small 240x96 six-colour thumbnails, not full-resolution
-  photographs. Live thumbnails depend on JetPhotos/Planespotters; when they are
-  unavailable the bundled per-type photos are shown. No airline logos, painted
-  skies or AI artwork.
+- Aircraft images are 320x128 live thumbnails or 480x192 bundled fallbacks,
+  six-colour and card-sized; they are not full-resolution photographs. Live
+  thumbnails depend on JetPhotos/Planespotters; when they are unavailable the
+  bundled per-type photos are shown. No airline logos, painted skies or AI
+  artwork.
 - Routes are best-effort. adsbdb may not know a flight, and route lookups add a
   second API dependency and up to four HTTPS requests per wake; the RTC cache
   reduces repeat queries. Distance/bearing is always shown when no route is
   available.
 - TLS certificate verification is disabled (`setInsecure()`) because the
   firmware does not ship a CA bundle. The feed is public and read-only, but a
-  man-in-the-middle could alter the displayed data.
+  man-in-the-middle could alter the displayed data. The public image proxy
+  (`images.weserv.nl`) is fetched over plain HTTP because it is decorative and
+  read-only; the aircraft metadata APIs remain on HTTPS.
 - One location per device. Moving the display requires reconfiguring the
   portal.
 - The public feed can be unavailable or rate-limited; the panel shows an error

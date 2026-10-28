@@ -42,8 +42,8 @@ constexpr int16_t kGridGapX = 10;
 constexpr int16_t kGridGapY = 8;
 
 // Photo cards: 280x96, four bits per pixel, six-colour palette indices.
-constexpr int16_t kPhotoW = 240;
-constexpr int16_t kPhotoH = 96;
+constexpr int16_t kPhotoW = 320;
+constexpr int16_t kPhotoH = 128;
 constexpr uint16_t kPhotoBytes = (kPhotoW * kPhotoH * 3 + 7) / 8 + 2;
 constexpr size_t kJpegBufferSize = 16 * 1024;
 
@@ -65,17 +65,35 @@ struct PhotoCard {
   uint8_t pixels[kPhotoBytes];
 };
 
-PhotoCard* g_photos = nullptr;
-uint8_t* g_jpeg_buffer = nullptr;
+enum class PhotoFormat : uint8_t { Packed3, Rgb332 };
+
+// A packed image plus its dimensions. Live photos are 3-bit palette indices
+// (dithered at source resolution); bundled fallbacks are RGB332 data dithered
+// at the final card resolution.
+struct PhotoView {
+  const uint8_t* pixels;
+  uint16_t width;
+  uint16_t height;
+  PhotoFormat format;
+};
+
+// Allocate each 15 KB packed card separately. The heap is fragmented after
+// Wi-Fi/TLS, so this is much more reliable than one large block.
+PhotoCard* g_photos[AIR_TRAFFIC_PAGE_AIRCRAFT] = {};
 
 bool ensure_photo_store() {
-  if (!g_jpeg_buffer) {
-    g_jpeg_buffer = (uint8_t*)malloc(kJpegBufferSize);
+  bool ok = true;
+  for (uint8_t i = 0; i < AIR_TRAFFIC_PAGE_AIRCRAFT; i++) {
+    if (!g_photos[i]) {
+      g_photos[i] = (PhotoCard*)malloc(sizeof(PhotoCard));
+    }
+    if (g_photos[i]) {
+      g_photos[i]->valid = false;
+    } else {
+      ok = false;
+    }
   }
-  if (!g_photos) {
-    g_photos = (PhotoCard*)malloc(sizeof(PhotoCard) * AIR_TRAFFIC_PAGE_AIRCRAFT);
-  }
-  return g_photos != nullptr && g_jpeg_buffer != nullptr;
+  return ok;
 }
 
 const AirTrafficData* g_traffic = nullptr;
@@ -311,21 +329,34 @@ void resolve_route(AirTrafficAircraft& aircraft, uint32_t now) {
   route_cache_put(aircraft.callsign, aircraft.route, now);
 }
 
-uint8_t photo_index(uint8_t r, uint8_t g, uint8_t b, int16_t x, int16_t y) {
-  // A light 8x8 Bayer offset breaks up the large flat areas that the six panel
-  // inks cannot reproduce. The amplitude is small enough to avoid a visible
-  // grid at the 240x96 thumbnail size.
-  static const int8_t kBayer8[8][8] = {
-      {-16, 0, -12, 4, -14, 2, -10, 6},
-      {8, -8, 12, -4, 10, -6, 14, -2},
-      {-12, 4, -16, 0, -10, 6, -14, 2},
-      {12, -4, 8, -8, 14, -2, 10, -6},
-      {-14, 2, -10, 6, -16, 0, -12, 4},
-      {10, -6, 14, -2, 8, -8, 12, -4},
-      {-10, 6, -14, 2, -12, 4, -16, 0},
-      {14, -2, 10, -6, 12, -4, 8, -8},
+uint8_t photo_nearest_index(uint8_t r, uint8_t g, uint8_t b) {
+  uint8_t best = 1;
+  uint32_t best_distance = 0xFFFFFFFFu;
+  for (uint8_t i = 0; i < 6; i++) {
+    const int dr = (int)r - kPhotoPalette[i][0];
+    const int dg = (int)g - kPhotoPalette[i][1];
+    const int db = (int)b - kPhotoPalette[i][2];
+    const uint32_t distance =
+        (uint32_t)(3 * dr * dr + 4 * dg * dg + 2 * db * db);
+    if (distance < best_distance) {
+      best_distance = distance;
+      best = i;
+    }
+  }
+  return best;
+}
+
+uint8_t photo_index_dither(uint8_t r, uint8_t g, uint8_t b, int16_t x,
+                           int16_t y) {
+  // A light ordered dither at the final display resolution. It is used for the
+  // bundled fallback images, which are stored as smooth RGB332 data.
+  static const int8_t kBayer4[4][4] = {
+      {-8, 0, -6, 2},
+      {4, -4, 6, -2},
+      {-6, 2, -8, 0},
+      {6, -2, 4, -4},
   };
-  const int offset = kBayer8[y & 7][x & 7];
+  const int offset = kBayer4[y & 3][x & 3];
   int rr = (int)r + offset;
   int gg = (int)g + offset;
   int bb = (int)b + offset;
@@ -335,21 +366,13 @@ uint8_t photo_index(uint8_t r, uint8_t g, uint8_t b, int16_t x, int16_t y) {
   if (gg > 255) gg = 255;
   if (bb < 0) bb = 0;
   if (bb > 255) bb = 255;
+  return photo_nearest_index((uint8_t)rr, (uint8_t)gg, (uint8_t)bb);
+}
 
-  uint8_t best = 1;
-  uint32_t best_distance = 0xFFFFFFFFu;
-  for (uint8_t i = 0; i < 6; i++) {
-    const int dr = rr - kPhotoPalette[i][0];
-    const int dg = gg - kPhotoPalette[i][1];
-    const int db = bb - kPhotoPalette[i][2];
-    const uint32_t distance =
-        (uint32_t)(3 * dr * dr + 4 * dg * dg + 2 * db * db);
-    if (distance < best_distance) {
-      best_distance = distance;
-      best = i;
-    }
-  }
-  return best;
+void rgb332_to_rgb(uint8_t packed, int& r, int& g, int& b) {
+  r = ((packed >> 5) & 7) * 255 / 7;
+  g = ((packed >> 2) & 7) * 255 / 7;
+  b = (packed & 3) * 255 / 3;
 }
 
 void photo_set(PhotoCard& photo, int x, int y, uint8_t index) {
@@ -410,7 +433,7 @@ int jpeg_draw_callback(JPEGDRAW* draw) {
       const uint8_t g = (uint8_t)(((rgb565 >> 5) & 0x3F) << 2);
       const uint8_t b = (uint8_t)((rgb565 & 0x1F) << 3);
       const uint8_t index =
-          photo_index(r, g, b, (int16_t)tx0, (int16_t)ty0);
+          photo_index_dither(r, g, b, (int16_t)tx0, (int16_t)ty0);
       for (int ty = ty0; ty <= ty1; ty++) {
         for (int tx = tx0; tx <= tx1; tx++) {
           photo_set(*g_active_photo, tx, ty, index);
@@ -445,8 +468,8 @@ bool process_photo(const uint8_t* jpeg_bytes, size_t jpeg_size,
   const int source_h = decoder->getHeight();
   if (source_w < 100 || source_h < 32) return false;
 
-  // The Weserv proxy already returns a 200x64 baseline JPEG. Take a slightly
-  // jittered crop and let the paper dither hide the lost resolution.
+  // The Weserv proxy returns a kPhotoW x kPhotoH baseline JPEG. Take a
+  // slightly jittered crop and let the paper dither hide the lost resolution.
   g_jpeg_out_w = source_w;
   g_jpeg_out_h = source_h;
   int crop_w = (source_w * 96) / 100;
@@ -484,7 +507,17 @@ bool process_photo(const uint8_t* jpeg_bytes, size_t jpeg_size,
   return true;
 }
 
+void log_host_dns(const char* host) {
+  IPAddress ip;
+  if (WiFi.hostByName(host, ip)) {
+    Serial.printf("[net] %s -> %s\n", host, ip.toString().c_str());
+  } else {
+    Serial.printf("[net] %s -> DNS failed\n", host);
+  }
+}
+
 bool jetapi_thumbnail(const char* registration, char* out, size_t size) {
+  log_host_dns("www.jetapi.dev");
   char api[160];
   snprintf(api, sizeof(api),
            "https://www.jetapi.dev/api?reg=%s&photos=2&flights=0",
@@ -511,8 +544,9 @@ bool jetapi_thumbnail(const char* registration, char* out, size_t size) {
       http.end();
       break;
     }
-    Serial.printf("[air] jetapi %s: HTTP %d (attempt %d)\n", registration,
-                  code, attempt + 1);
+    Serial.printf("[air] jetapi %s: HTTP %d (%s) (attempt %d)\n",
+                  registration, code, http.errorToString(code).c_str(),
+                  attempt + 1);
     http.end();
     delay(300);
   }
@@ -550,6 +584,7 @@ bool jetapi_thumbnail(const char* registration, char* out, size_t size) {
 }
 
 bool planespotters_thumbnail(const char* registration, char* out, size_t size) {
+  log_host_dns("api.planespotters.net");
   char api[160];
   snprintf(api, sizeof(api),
            "https://api.planespotters.net/pub/photos/reg/%s", registration);
@@ -566,7 +601,8 @@ bool planespotters_thumbnail(const char* registration, char* out, size_t size) {
 
   const int code = http.GET();
   if (code != 200) {
-    Serial.printf("[air] planespotters %s: HTTP %d\n", registration, code);
+    Serial.printf("[air] planespotters %s: HTTP %d (%s)\n", registration,
+                  code, http.errorToString(code).c_str());
     http.end();
     return false;
   }
@@ -590,16 +626,18 @@ bool planespotters_thumbnail(const char* registration, char* out, size_t size) {
 
 void weserv_url(const char* source, char* out, size_t size) {
   snprintf(out, size,
-           "https://images.weserv.nl/?url=%s&w=240&h=96&fit=cover"
+           "http://images.weserv.nl/?url=%s&w=%d&h=%d&fit=cover"
            "&output=jpg&q=80",
-           source);
+           source, (int)kPhotoW, (int)kPhotoH);
 }
 
-bool download_photo(const char* url, uint8_t* buffer, size_t capacity,
+bool download_photo(const char* url, uint8_t*& buffer, size_t capacity,
                     size_t& length) {
   length = 0;
-  WiFiClientSecure client;
-  client.setInsecure();
+  buffer = nullptr;
+  // The image proxy is public and read-only. Plain HTTP avoids a second TLS
+  // handshake next to the live photo buffers; the metadata APIs stay on HTTPS.
+  WiFiClient client;
   HTTPClient http;
   http.setTimeout(20000);
   http.setUserAgent(
@@ -628,8 +666,18 @@ bool download_photo(const char* url, uint8_t* buffer, size_t capacity,
   }
   Serial.printf("[air] photo: HTTP 200, size %d\n", size);
 
+  buffer = (uint8_t*)malloc((size_t)size);
+  if (!buffer) {
+    Serial.printf("[air] photo: body allocation failed, heap %u\n",
+                  (unsigned)ESP.getFreeHeap());
+    http.end();
+    return false;
+  }
+
   WiFiClient* stream = http.getStreamPtr();
   if (!stream) {
+    free(buffer);
+    buffer = nullptr;
     http.end();
     return false;
   }
@@ -649,7 +697,12 @@ bool download_photo(const char* url, uint8_t* buffer, size_t capacity,
   http.end();
   length = total;
   Serial.printf("[air] photo: read %u/%d bytes\n", (unsigned)total, size);
-  return total == (size_t)size;
+  if (total != (size_t)size) {
+    free(buffer);
+    buffer = nullptr;
+    return false;
+  }
+  return true;
 }
 
 struct PhotoUrlCache {
@@ -733,7 +786,26 @@ bool find_photo_url(const char* registration, uint32_t now, char* out,
   return true;
 }
 
+struct PhotoUrl {
+  char url[256];
+  bool valid;
+};
+
 void fetch_photos(AirTrafficData& data) {
+  // Resolve all source URLs first, while the full photo heap is still free.
+  // The TLS handshake for JetAPI/Planespotters needs more headroom than the
+  // image downloads that follow.
+  static PhotoUrl photo_urls[AIR_TRAFFIC_PAGE_AIRCRAFT];
+  for (uint8_t i = 0; i < AIR_TRAFFIC_PAGE_AIRCRAFT; i++) {
+    photo_urls[i].valid = false;
+    if (i >= data.count) continue;
+    AirTrafficAircraft& aircraft = data.aircraft[i];
+    if (!aircraft.registration[0]) continue;
+    photo_urls[i].valid =
+        find_photo_url(aircraft.registration, data.feed_time,
+                       photo_urls[i].url, sizeof(photo_urls[i].url));
+  }
+
   if (!ensure_photo_store()) {
     Serial.printf("[air] photo buffers: allocation failed, heap %u\n",
                   (unsigned)ESP.getFreeHeap());
@@ -742,30 +814,34 @@ void fetch_photos(AirTrafficData& data) {
   Serial.printf("[air] photo buffers: heap %u\n",
                 (unsigned)ESP.getFreeHeap());
   for (uint8_t i = 0; i < AIR_TRAFFIC_PAGE_AIRCRAFT; i++) {
-    g_photos[i].valid = false;
+    if (g_photos[i]) g_photos[i]->valid = false;
   }
 
   for (uint8_t i = 0; i < data.count && i < AIR_TRAFFIC_PAGE_AIRCRAFT; i++) {
+    if (!photo_urls[i].valid) continue;
     AirTrafficAircraft& aircraft = data.aircraft[i];
-    if (!aircraft.registration[0]) continue;
 
-    char url[256];
-    if (!find_photo_url(aircraft.registration, data.feed_time, url,
-                        sizeof(url))) {
+    // download_photo() allocates the exact body size only after the TLS
+    // handshake, so the handshake sees the full remaining heap.
+    uint8_t* jpeg = nullptr;
+    size_t jpeg_size = 0;
+    bool downloaded =
+        download_photo(photo_urls[i].url, jpeg, kJpegBufferSize, jpeg_size);
+    if (!downloaded) {
+      delay(250);
+      downloaded =
+          download_photo(photo_urls[i].url, jpeg, kJpegBufferSize, jpeg_size);
+    }
+    if (!downloaded) {
+      photo_cache_invalidate(aircraft.registration);
+      free(jpeg);
       continue;
     }
 
-    size_t jpeg_size = 0;
-    if (!download_photo(url, g_jpeg_buffer, kJpegBufferSize, jpeg_size)) {
-      delay(250);
-      if (!download_photo(url, g_jpeg_buffer, kJpegBufferSize, jpeg_size)) {
-        photo_cache_invalidate(aircraft.registration);
-        continue;
-      }
-    }
-
     const uint32_t start = millis();
-    if (!process_photo(g_jpeg_buffer, jpeg_size, g_photos[i])) {
+    const bool decoded = process_photo(jpeg, jpeg_size, *g_photos[i]);
+    free(jpeg);
+    if (!decoded) {
       photo_cache_invalidate(aircraft.registration);
       Serial.printf("[air] photo %s: decode failed\n", aircraft.registration);
       continue;
@@ -962,13 +1038,18 @@ const TypePhoto kTypePhotos[] = {
     {"S92", kFallbackA139},
 };
 
-const uint8_t* fallback_photo_for_type(const char* type) {
+PhotoView fallback_photo_for_type(const char* type) {
+  const uint8_t* pixels = kFallbackA320;
   if (type && type[0]) {
     for (const TypePhoto& entry : kTypePhotos) {
-      if (strcmp(type, entry.code) == 0) return entry.pixels;
+      if (strcmp(type, entry.code) == 0) {
+        pixels = entry.pixels;
+        break;
+      }
     }
   }
-  return kFallbackA320;
+  return {pixels, kFallbackPhotoWidth, kFallbackPhotoHeight,
+          PhotoFormat::Rgb332};
 }
 
 bool load_config(AirTrafficConfig& config) {
@@ -1620,16 +1701,50 @@ bool fetch_traffic(AirTrafficData& data, const AirTrafficConfig& config) {
   return true;
 }
 
-void draw_photo(epd::Display& display, const uint8_t* pixels, int16_t box_x,
+void sample_rgb332(const PhotoView& photo, int16_t dx, int16_t dy,
+                   int16_t out_w, int16_t out_h, int& r, int& g, int& b) {
+  const int32_t fx = ((int32_t)dx * photo.width << 8) / out_w;
+  const int32_t fy = ((int32_t)dy * photo.height << 8) / out_h;
+  const int16_t x0 = (int16_t)(fx >> 8);
+  const int16_t y0 = (int16_t)(fy >> 8);
+  int16_t x1 = x0 + 1;
+  int16_t y1 = y0 + 1;
+  if (x1 >= (int16_t)photo.width) x1 = (int16_t)photo.width - 1;
+  if (y1 >= (int16_t)photo.height) y1 = (int16_t)photo.height - 1;
+  const int32_t wx = fx & 0xFF;
+  const int32_t wy = fy & 0xFF;
+
+  const uint8_t* row0 = photo.pixels + (uint32_t)y0 * photo.width;
+  const uint8_t* row1 = photo.pixels + (uint32_t)y1 * photo.width;
+  int r00, g00, b00, r10, g10, b10;
+  int r01, g01, b01, r11, g11, b11;
+  rgb332_to_rgb(row0[x0], r00, g00, b00);
+  rgb332_to_rgb(row0[x1], r10, g10, b10);
+  rgb332_to_rgb(row1[x0], r01, g01, b01);
+  rgb332_to_rgb(row1[x1], r11, g11, b11);
+
+  const int32_t w00 = (256 - wx) * (256 - wy);
+  const int32_t w10 = wx * (256 - wy);
+  const int32_t w01 = (256 - wx) * wy;
+  const int32_t w11 = wx * wy;
+  r = (r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11) >> 16;
+  g = (g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11) >> 16;
+  b = (b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11) >> 16;
+}
+
+void draw_photo(epd::Display& display, const PhotoView& photo, int16_t box_x,
                 int16_t box_y, int16_t box_w, int16_t box_h, float scale,
                 int16_t page_top, int16_t page_bottom) {
-  if (!pixels || scale <= 0.0f) return;
+  if (!photo.pixels || photo.width == 0 || photo.height == 0 ||
+      scale <= 0.0f) {
+    return;
+  }
 
   int16_t pw = box_w;
-  int16_t ph = (int16_t)((int32_t)box_w * kPhotoH / kPhotoW);
+  int16_t ph = (int16_t)((int32_t)box_w * photo.height / photo.width);
   if (ph > box_h) {
     ph = box_h;
-    pw = (int16_t)((int32_t)box_h * kPhotoW / kPhotoH);
+    pw = (int16_t)((int32_t)box_h * photo.width / photo.height);
   }
   pw = (int16_t)(pw * scale);
   ph = (int16_t)(ph * scale);
@@ -1646,20 +1761,101 @@ void draw_photo(epd::Display& display, const uint8_t* pixels, int16_t box_x,
   int16_t end = page_bottom - py;
   if (end > ph) end = ph;
 
-  for (int16_t dy = start; dy < end; dy++) {
-    const int16_t sy = (int16_t)((int32_t)dy * kPhotoH / ph);
-    for (int16_t dx = 0; dx < pw; dx++) {
-      const int16_t sx = (int16_t)((int32_t)dx * kPhotoW / pw);
-      const uint32_t bit = ((uint32_t)sy * kPhotoW + sx) * 3;
-      const uint16_t byte = (uint16_t)(bit >> 3);
-      const uint8_t shift = (uint8_t)(bit & 7);
-      uint32_t value = (uint32_t)pixels[byte] |
-                       ((uint32_t)pixels[byte + 1] << 8) |
-                       ((uint32_t)pixels[byte + 2] << 16);
-      uint8_t index = (uint8_t)((value >> shift) & 7);
-      if (index > 5) index = 1;
-      display.drawPixel(px + dx, py + dy, kPhotoColors[index]);
+  if (photo.format == PhotoFormat::Packed3) {
+    for (int16_t dy = start; dy < end; dy++) {
+      const int16_t sy = (int16_t)((int32_t)dy * photo.height / ph);
+      for (int16_t dx = 0; dx < pw; dx++) {
+        const int16_t sx = (int16_t)((int32_t)dx * photo.width / pw);
+        const uint32_t bit = ((uint32_t)sy * photo.width + sx) * 3;
+        const uint32_t byte = bit >> 3;
+        const uint8_t shift = (uint8_t)(bit & 7);
+        uint32_t value = (uint32_t)photo.pixels[byte] |
+                         ((uint32_t)photo.pixels[byte + 1] << 8) |
+                         ((uint32_t)photo.pixels[byte + 2] << 16);
+        uint8_t index = (uint8_t)((value >> shift) & 7);
+        if (index > 5) index = 1;
+        display.drawPixel(px + dx, py + dy, kPhotoColors[index]);
+      }
     }
+    return;
+  }
+
+  {
+    // Sample the smooth RGB332 image with bilinear interpolation, then run
+    // Floyd-Steinberg to the six inks at the final display resolution. This
+    // avoids resampling an already-dithered bitmap and keeps the aircraft
+    // edges clean while still mixing the limited palette.
+    const size_t error_values = (size_t)pw * 3 * 2;
+    int16_t* errors =
+        (int16_t*)malloc(error_values * sizeof(int16_t));
+    if (!errors) {
+      for (int16_t dy = start; dy < end; dy++) {
+        for (int16_t dx = 0; dx < pw; dx++) {
+          int r, g, b;
+          sample_rgb332(photo, dx, dy, pw, ph, r, g, b);
+          const uint8_t index = photo_index_dither(
+              (uint8_t)r, (uint8_t)g, (uint8_t)b, px + dx, py + dy);
+          display.drawPixel(px + dx, py + dy, kPhotoColors[index]);
+        }
+      }
+      return;
+    }
+    memset(errors, 0, error_values * sizeof(int16_t));
+    int16_t* current = errors;
+    int16_t* following = errors + (size_t)pw * 3;
+
+    for (int16_t dy = 0; dy < ph; dy++) {
+      for (int16_t dx = 0; dx < pw; dx++) {
+        int r, g, b;
+        sample_rgb332(photo, dx, dy, pw, ph, r, g, b);
+        const size_t e = (size_t)dx * 3;
+        int rr = r + current[e];
+        int gg = g + current[e + 1];
+        int bb = b + current[e + 2];
+        if (rr < 0) rr = 0;
+        if (rr > 255) rr = 255;
+        if (gg < 0) gg = 0;
+        if (gg > 255) gg = 255;
+        if (bb < 0) bb = 0;
+        if (bb > 255) bb = 255;
+
+        const uint8_t index = photo_nearest_index(
+            (uint8_t)rr, (uint8_t)gg, (uint8_t)bb);
+        const int er = rr - kPhotoPalette[index][0];
+        const int eg = gg - kPhotoPalette[index][1];
+        const int eb = bb - kPhotoPalette[index][2];
+
+        if (dx + 1 < pw) {
+          current[e + 3] += (int16_t)(er * 7 / 16);
+          current[e + 4] += (int16_t)(eg * 7 / 16);
+          current[e + 5] += (int16_t)(eb * 7 / 16);
+        }
+        if (dy + 1 < ph) {
+          if (dx > 0) {
+            following[e - 3] += (int16_t)(er * 3 / 16);
+            following[e - 2] += (int16_t)(eg * 3 / 16);
+            following[e - 1] += (int16_t)(eb * 3 / 16);
+          }
+          following[e] += (int16_t)(er * 5 / 16);
+          following[e + 1] += (int16_t)(eg * 5 / 16);
+          following[e + 2] += (int16_t)(eb * 5 / 16);
+          if (dx + 1 < pw) {
+            following[e + 3] += (int16_t)(er * 1 / 16);
+            following[e + 4] += (int16_t)(eg * 1 / 16);
+            following[e + 5] += (int16_t)(eb * 1 / 16);
+          }
+        }
+
+        if (dy >= start && dy < end) {
+          display.drawPixel(px + dx, py + dy, kPhotoColors[index]);
+        }
+      }
+      int16_t* swap = current;
+      current = following;
+      following = swap;
+      memset(following, 0, (size_t)pw * 3 * sizeof(int16_t));
+    }
+    free(errors);
   }
 }
 
@@ -1707,13 +1903,14 @@ uint8_t build_layout(const AirTrafficData& data, PosterCard* cards) {
 void draw_card(epd::Display& display, const PosterCard& card,
                const AirTrafficAircraft& aircraft, int16_t page_top,
                int16_t page_bottom) {
-  const PhotoCard* live_photo =
-      (g_photos && card.index < AIR_TRAFFIC_PAGE_AIRCRAFT)
-          ? &g_photos[card.index]
-          : nullptr;
-  const uint8_t* photo =
+  const PhotoCard* live_photo = nullptr;
+  if (card.index < AIR_TRAFFIC_PAGE_AIRCRAFT) {
+    live_photo = g_photos[card.index];
+  }
+  const PhotoView photo =
       (live_photo && live_photo->valid)
-          ? live_photo->pixels
+          ? PhotoView{live_photo->pixels, (uint16_t)kPhotoW,
+                      (uint16_t)kPhotoH, PhotoFormat::Packed3}
           : fallback_photo_for_type(aircraft.type);
 
   char altitude[32];
@@ -1726,7 +1923,7 @@ void draw_card(epd::Display& display, const PosterCard& card,
     const int16_t box_y = card.y + 10;
     const int16_t box_w = card.w - 12;
     const int16_t box_h = 300;
-    if (photo) {
+    if (photo.pixels) {
       draw_photo(display, photo, box_x, box_y, box_w, box_h, 1.0f,
                  page_top, page_bottom);
     }
@@ -1740,7 +1937,7 @@ void draw_card(epd::Display& display, const PosterCard& card,
     const int16_t box_y = card.y + 8;
     const int16_t box_w = 450;
     const int16_t box_h = 190;
-    if (photo) {
+    if (photo.pixels) {
       draw_photo(display, photo, box_x, box_y, box_w, box_h, 1.0f,
                  page_top, page_bottom);
     }
@@ -1756,7 +1953,7 @@ void draw_card(epd::Display& display, const PosterCard& card,
     const int16_t box_y = card.y + 4;
     const int16_t box_w = card.w - 4;
     const int16_t box_h = 154;
-    if (photo) {
+    if (photo.pixels) {
       draw_photo(display, photo, box_x, box_y, box_w, box_h, 1.0f,
                  page_top, page_bottom);
     }

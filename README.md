@@ -177,8 +177,8 @@ include/air_traffic.h          Air-traffic data structures and airTrafficRun()
 include/air_traffic_config.h   Portal, radius, update and layout constants
 src/main.cpp                   Panel init, OTP test modes, air-traffic entry point
 src/air_traffic.cpp            Wi-Fi portal, adsb.lol fetch, poster renderer
-src/fallback_photos.h          Dithered fallback photos (PROGMEM)
-tools/make_fallback_photos.py  Fallback photo cropper/ditherer (Pillow)
+src/fallback_photos.h          RGB332 fallback photos (PROGMEM)
+tools/make_fallback_photos.py  Fallback photo cropper/RGB332 packer (Pillow)
 tools/dump_otp.py              Serial OTP dump capture (pyserial)
 docs/hardware.md               Board, panel, pinout and assembly
 docs/air-traffic.md            Standalone air-traffic mode and poster layout
