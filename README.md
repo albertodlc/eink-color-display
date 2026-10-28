@@ -96,7 +96,9 @@ The official Good Display manual uses Arduino IDE:
    `include/board_esp32_l_c73.h`.
 
 The air-traffic sources and the custom `partitions.csv` (3.5 MB application)
-are set up for PlatformIO. The Arduino IDE alternative needs a matching 3.5 MB
+are set up for PlatformIO. `platformio.ini` enables `-Os`; without an explicit
+optimization flag this PlatformIO/Arduino 3.x combination falls back to `-O0`,
+which makes the drawing and JPEG loops roughly three times slower. The Arduino IDE alternative needs a matching 3.5 MB
 app partition.
 
 Do not use the `ESP32epdx` examples for this panel: its current tree has no
@@ -189,12 +191,18 @@ Each wake performs one full refresh, so boot-to-content is one panel cycle
 (~27 s). The air-traffic mode logs:
 
 ```text
-[air] render total 27425 ms (panel 26022 ms)
+[air] view mode 0, boot 417 ms
+[air] fetch done at 20023 ms
+[air] page loop 27278 ms, photo dither 0 ms
+[air] render total 27286 ms (panel 26235 ms)
 ```
 
-The draw part is Adafruit GFX rendering; each paged pass only draws the 160-row
-band that belongs to its page. The transfer part covers page-buffer clearing,
-the 192 KB SPI transfer and the power-off command. The panel part is the
+A four-photo auto view therefore takes about 1.0 s to draw on top of the
+26.2 s panel refresh; the rest of the wake is Wi-Fi/TLS/feed/photo fetching.
+The single-aircraft view spends about 0.8 s diffusing its large photo. The draw
+part is Adafruit GFX rendering; each paged pass only draws the 3-pixel band that
+belongs to its page. The transfer part covers page-buffer clearing, the 192 KB
+SPI transfer and the power-off command. The panel part is the
 electrophoretic waveform and is fixed by the panel; it is not affected by SPI
 speed, CPU speed or image content. It is temperature compensated, so a cold
 panel is slower (the 15-22 s datasheet figure is at about 25 °C).

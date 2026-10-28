@@ -179,8 +179,13 @@ black/white instead of green/yellow, which the panel cannot represent as gray.
 Grid cards keep a 3-bit packed bitmap with light colour dithering. The
 single-aircraft view keeps the live image as RGB332 and uses Floyd-Steinberg at
 the final card resolution, so the large image has smoother tone and avoids an
-upscaled checkerboard. The bundled fallbacks are stored as smooth 480x192
-RGB332 data and Floyd-Steinberg dithered at the final card resolution.
+upscaled checkerboard. The panel is drawn in 3-pixel page bands; the dither
+error rows are carried from band to band, so each output pixel is diffused
+exactly once instead of once per band (with 180-degree rotation the diffusion
+runs bottom-up in the same order as the pages). The bilinear coordinate maps
+and the RGB332 expansion tables are precomputed per photo. The bundled
+fallbacks are stored as smooth 480x192 RGB332 data and Floyd-Steinberg
+dithered at the final card resolution.
 
 ### Character set
 
@@ -312,10 +317,22 @@ map are included. Poster modes keep the configured radius. The firmware draws:
   the grid contains more than the 40 stored aircraft.
 
 There is no range circle or other legend over the map. The vector image is
-rasterised once per wake into a 96 KB two-bit buffer at 800x480 (split into four
-24 KB blocks for heap reliability), which takes about 8.9 s on the ESP32; the
-panel refresh still dominates the wake. If the buffer cannot be allocated, the
-panel shows `MAP DATA UNAVAILABLE`.
+rasterised once per wake into a 96 KB two-bit buffer at 800x480 (split into
+eight 12 KB blocks for heap reliability). The ocean fill processes 60-row
+bands: for each band, one pass counts crossings and a second stores every
+crossing in a 4 KB pool reserved at boot on map wakes; the rows are sorted and
+filled in pairs.
+A fixed 8-slot table used earlier in development dropped 2,260 of the 6,100
+crossings for the default view, leaving holes in the water. The banded pool
+keeps all crossings without a late heap allocation, which failed once the map
+buffer had fragmented the heap. A 60-row band peaks at about 1,460 crossings on the
+tested locations, so the 2,048-entry pool has margin; if a band ever exceeds
+it, the renderer falls back to the original per-row scan. If the 96 KB map
+buffer cannot be allocated, the panel shows `MAP DATA UNAVAILABLE`.
+
+With `-Os` the rasterisation takes about **300 ms** (263 ms ocean fill, 12 ms
+districts, 1 ms borders, 15 ms coastlines, 13 ms labels and rivers); the panel
+refresh still dominates the wake.
 
 The source is Natural Earth: 1:50m ocean polygons, country borders and rivers,
 plus 1:10m first-order district boundaries, district labels and populated
@@ -335,9 +352,10 @@ on the 4 MB flash):
 board_build.partitions = partitions.csv
 ```
 
-Measured cycling build: about **3.30 MB flash (90%)** and **118 KB static RAM
-(36%)**. The partition table keeps NVS at the same offset, so Wi-Fi credentials
-and the location survive a normal USB flash.
+Measured cycling build with `-Os`: about **2.93 MB flash (80% of the 3.5 MB
+application partition)** and **118 KB static RAM (36%)**. The partition table
+keeps NVS at the same offset, so Wi-Fi credentials and the location survive a
+normal USB flash.
 
 ### PlatformIO / ESP32 Arduino 3.x note
 
@@ -353,8 +371,17 @@ lib_deps =
 
 build_flags =
   -DCORE_DEBUG_LEVEL=0
+  -Os
   -I$PROJECT_PACKAGES_DIR/framework-arduinoespressif32/libraries/Network/src
 ```
+
+The explicit `-Os` matters: with this PlatformIO / Arduino 3.x combination the
+project files otherwise compile without an optimization flag (GCC defaults to
+`-O0`). Adding it cut the feature-photo dither from 3.0 s to 0.86 s, JPEG
+decode from 225 ms to 71 ms, and it reduced the application image by about
+400 KB. The exact vector-map raster now takes about 300 ms; the old 373 ms
+number came from a faster but lossy scanline table that dropped crossings. Without it the firmware is
+roughly three times slower in every drawing loop.
 
 Do not point `lib_extra_dirs` at the `Network` folder itself: PlatformIO then
 treats its `src` subfolder as a separate library and the WiFi build still fails.
@@ -364,25 +391,42 @@ treats its `src` subfolder as a separate library and the WiFi build still fails.
 Representative serial log (location/radius replaced with a generic example):
 
 ```text
-[air] view mode 2
-[air] Wi-Fi connect
-[air] location 51.50740, -0.12780 radius 100 km
-[air] GET https://api.adsb.lol/v2/lat/51.50740/lon/-0.12780/dist/28
-[air] payload 12544 bytes
-[air] route RYR6GY: Dublin to Milan
-[air] 25 aircraft within 100 km (10 stored)
-[air] free heap 189900 bytes
-_PowerOn : 172001
-_refresh : 26018997
-_PowerOff : 139001
-[air] render total 27425 ms (panel 26022 ms)
+[air] view mode 0, boot 417 ms
+[air] fetch done at 20898 ms
+[air] page loop 27277 ms, photo dither 0 ms
+[air] render total 27285 ms (panel 26233 ms)
 [air] deep sleep 300 s
 ```
 
 The panel refresh dominates. Wi-Fi/TLS/fetch, route lookups and JSON parsing
 happen before the refresh and are not visible in the panel BUSY time. The page
 uses the paged GxEPD2 API (160 bands of 3 px), so it transfers the same 192 KB
-full-panel framebuffer.
+full-panel framebuffer. A four-photo auto view therefore draws in about 1.0 s
+on top of the 26.2 s panel refresh.
+
+The single-aircraft view spends about 0.8 s on its large Floyd-Steinberg photo;
+the vector map spends about 0.13 s rasterising plus the page blit:
+
+```text
+[air] view mode 2, boot 417 ms
+[air] fetch done at 8768 ms
+[air] page loop 27846 ms, photo dither 771 ms
+[air] render total 27857 ms (panel 26248 ms)
+
+[air] view mode 6, boot 418 ms
+[air] fetch done at 7864 ms
+[air] map fill: 6100 crossings, max 22/row
+[air] map timing: fill 263, district 12, border 1, coast 15, rest 13
+[air] vector map q=-1035..-130, 8463..8858 in 305 ms, heap 76752
+[air] render total 27974 ms (panel 26230 ms)
+```
+
+The route and JetAPI lookups keep their TLS session open between sequential
+requests, then stop it before the photo buffers are allocated. Missing routes
+are not retried on a 4xx response, which avoids a second handshake for every
+unknown callsign. Typical wakes fetch in about 5 s for the map, 10 s for the
+single view and 20 s for four photo cards; Wi-Fi association and TLS setup are
+the remaining fixed costs.
 
 The feed is scanned directly from the TLS stream one aircraft object at a time.
 The firmware never buffers the full body or builds a document for all aircraft;
@@ -406,12 +450,14 @@ disconnected:
 
 ```text
 [air] view mode 6
-[air] 37 aircraft in map view (37 stored)
-[air] vector map q=-1035..-130, 8463..8858 in 8939 ms, heap 81104
-[air] render total 35852 ms (panel 26233 ms)
+[air] 34 aircraft in map view (34 stored)
+[air] map fill: 6100 crossings, max 22/row
+[air] map timing: fill 263, district 12, border 1, coast 15, rest 13
+[air] vector map q=-1035..-130, 8463..8858 in 305 ms, heap 76752
+[air] render total 27974 ms (panel 26230 ms)
 ```
 
-The background is an 800x480 two-bit buffer (96 KB, four 24 KB blocks) with
+The background is an 800x480 two-bit buffer (96 KB, eight 12 KB blocks) with
 four inks. There is no map download and no JPEG decode, so no PSRAM is
 required.
 
@@ -431,8 +477,10 @@ required.
   names and major city names. City names use a lower-contrast green; aircraft
   identifiers use black labels, white text and country flags. It deliberately
   omits roads and raster tile labels, so it is cleaner but less detailed than a
-  street map. The 96 KB map buffer is allocated in four 24 KB blocks after
+  street map. The 96 KB map buffer is allocated in eight 12 KB blocks after
   Wi-Fi is disconnected; if that fails the panel shows `MAP DATA UNAVAILABLE`.
+  The 4 KB ocean crossing pool is reserved at boot on map wakes, so it cannot
+  fail after Wi-Fi fragments the heap.
 - TLS certificate verification is disabled (`setInsecure()`) because the
   firmware does not ship a CA bundle. The feed is public and read-only, but a
   man-in-the-middle could alter the displayed data. The public image proxy

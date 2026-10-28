@@ -65,12 +65,12 @@ constexpr int16_t kMapDisplayH = epd::kHeight;
 constexpr int16_t kMapCenterX = kMapDisplayW / 2;
 constexpr int16_t kMapCenterY = 256;
 constexpr int16_t kMapOffsetY = 16;
-// The background is 800x480 at two bits per pixel. It is split into four
-// 24 KB blocks so it can be allocated after Wi-Fi/TLS fragmentation.
+// The background is 800x480 at two bits per pixel. It is split into eight
+// 12 KB blocks so it can be allocated after Wi-Fi/TLS fragmentation.
 constexpr int16_t kMapBufferW = 800;
 constexpr int16_t kMapBufferH = 480;
 constexpr uint16_t kMapRowBytes = kMapBufferW / 4;
-constexpr uint8_t kMapBlockCount = 4;
+constexpr uint8_t kMapBlockCount = 8;
 constexpr uint16_t kMapBlockRows = kMapBufferH / kMapBlockCount;
 constexpr uint32_t kMapBlockBytes = kMapRowBytes * kMapBlockRows;
 constexpr uint32_t kMapBytes = kMapBlockBytes * kMapBlockCount;
@@ -83,6 +83,10 @@ int32_t g_q_lon_max = 0;
 int32_t g_q_lat_min = 0;
 int32_t g_q_lat_max = 0;
 float g_map_m_per_px = 458.3f;
+uint16_t g_visible_places[32] = {};
+uint8_t g_visible_place_count = 0;
+uint16_t g_visible_districts[16] = {};
+uint8_t g_visible_district_count = 0;
 #endif
 
 // Measured Spectra 6 appearance (Zephyr reTerminal E1002 reference panel).
@@ -567,6 +571,20 @@ void route_cache_put(const char* callsign, const char* route, uint32_t now) {
   g_route_cache[slot].fetched = now;
 }
 
+// adsbdb is queried once per displayed aircraft. Keeping the TLS session open
+// between those sequential requests removes three handshakes per wake. The
+// client lives on the heap so deleting it before the photo stage releases all
+// of its TLS buffers, not just the socket.
+WiFiClientSecure* g_route_client = nullptr;
+
+void stop_route_client() {
+  if (g_route_client) {
+    g_route_client->stop();
+    delete g_route_client;
+    g_route_client = nullptr;
+  }
+}
+
 void resolve_route(AirTrafficAircraft& aircraft, uint32_t now) {
   aircraft.route[0] = 0;
   if (!aircraft.callsign[0]) return;
@@ -593,15 +611,20 @@ void resolve_route(AirTrafficAircraft& aircraft, uint32_t now) {
   String payload;
   int code = -1;
   for (int attempt = 0; attempt < 2; attempt++) {
-    WiFiClientSecure client;
-    client.setInsecure();
+    if (!g_route_client) {
+      g_route_client = new (std::nothrow) WiFiClientSecure();
+      if (!g_route_client) return;
+      g_route_client->setInsecure();
+    }
     HTTPClient http;
+    http.setReuse(true);
     http.setTimeout(6000);
     http.setUserAgent("eink-color-display/1.0 (ESP32)");
     http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-    if (!http.begin(client, url)) {
+    if (!http.begin(*g_route_client, url)) {
       Serial.printf("[air] route %s: begin failed (attempt %d)\n",
                     aircraft.callsign, attempt + 1);
+      stop_route_client();
       delay(200);
       continue;
     }
@@ -614,6 +637,10 @@ void resolve_route(AirTrafficAircraft& aircraft, uint32_t now) {
     Serial.printf("[air] route %s: HTTP %d (attempt %d)\n", aircraft.callsign,
                   code, attempt + 1);
     http.end();
+    // A 4xx answer will not change on a second request; only retry transient
+    // failures so a missing route does not cost another TLS handshake.
+    if (code >= 400 && code < 500) break;
+    if (code <= 0) stop_route_client();
     delay(200);
   }
   if (code != 200 || payload.length() == 0) return;
@@ -706,10 +733,16 @@ uint8_t photo_index_dither(uint8_t r, uint8_t g, uint8_t b, int16_t x,
   return photo_nearest_index((uint8_t)rr, (uint8_t)gg, (uint8_t)bb);
 }
 
-void rgb332_to_rgb(uint8_t packed, int& r, int& g, int& b) {
-  r = ((packed >> 5) & 7) * 255 / 7;
-  g = ((packed >> 2) & 7) * 255 / 7;
-  b = (packed & 3) * 255 / 3;
+// Exact 3/3/2-bit to 8-bit expansion. Keeping these as tables avoids four
+// divisions per sampled photo pixel; the values match (v * 255) / 7 and
+// (v * 255) / 3 for every input.
+const uint8_t kRgb3To8[8] = {0, 36, 72, 109, 145, 182, 218, 255};
+const uint8_t kRgb2To8[4] = {0, 85, 170, 255};
+
+inline void rgb332_to_rgb(uint8_t packed, int& r, int& g, int& b) {
+  r = kRgb3To8[(packed >> 5) & 7];
+  g = kRgb3To8[(packed >> 2) & 7];
+  b = kRgb2To8[packed & 3];
 }
 
 void photo_set(PhotoCard& photo, int x, int y, uint8_t index) {
@@ -738,6 +771,35 @@ PhotoCard* g_active_photo = nullptr;
 JPEGDEC* g_photo_decoder = nullptr;
 uint8_t* g_decode_rgb = nullptr;
 uint8_t* g_feature_photo = nullptr;  // RGB332 320x128 for the large single view
+uint32_t g_photo_dither_ms = 0;
+
+// The panel is written in 3-row pages, and with 180-degree rotation the pages
+// arrive bottom-up. Floyd-Steinberg needs the error rows from the previously
+// processed row, so keep two rows of error state alive across page calls
+// instead of rediffusing the whole photo for every page.
+struct FeatureDitherState {
+  const uint8_t* pixels;
+  int16_t px;
+  int16_t py;
+  int16_t pw;
+  int16_t ph;
+  int16_t next_row;
+  bool active;
+  int16_t* rows;
+  size_t row_values;
+  int16_t* current;
+  int16_t* following;
+  uint16_t* x0;
+  uint16_t* x1;
+  uint16_t* y0;
+  uint16_t* y1;
+  uint8_t* wx;
+  uint8_t* wy;
+};
+// One state per card so a grid of fallback RGB332 photos does not reset the
+// diffusion when it switches from one card to the next within a page band.
+constexpr uint8_t kDitherStateCount = AIR_TRAFFIC_PAGE_AIRCRAFT;
+FeatureDitherState g_dither_states[kDitherStateCount] = {};
 bool g_feature_valid = false;
 int g_jpeg_out_w = 0;
 int g_jpeg_out_h = 0;
@@ -880,6 +942,29 @@ void log_host_dns(const char* host) {
   }
 }
 
+// JetAPI is queried for each card's photo URL and, in the single view, for the
+// flight history. Reuse one TLS session for those sequential lookups, then
+// delete it before the photo buffers are allocated so its TLS buffers return
+// to the heap.
+WiFiClientSecure* g_jetapi_client = nullptr;
+
+bool jetapi_client_ensure() {
+  if (!g_jetapi_client) {
+    g_jetapi_client = new (std::nothrow) WiFiClientSecure();
+    if (!g_jetapi_client) return false;
+    g_jetapi_client->setInsecure();
+  }
+  return true;
+}
+
+void stop_jetapi_client() {
+  if (g_jetapi_client) {
+    g_jetapi_client->stop();
+    delete g_jetapi_client;
+    g_jetapi_client = nullptr;
+  }
+}
+
 bool jetapi_thumbnail(const char* registration, char* out, size_t size) {
   log_host_dns("www.jetapi.dev");
   char api[160];
@@ -890,15 +975,16 @@ bool jetapi_thumbnail(const char* registration, char* out, size_t size) {
   String payload;
   int code = -1;
   for (int attempt = 0; attempt < 2; attempt++) {
-    WiFiClientSecure client;
-    client.setInsecure();
+    if (!jetapi_client_ensure()) return false;
     HTTPClient http;
+    http.setReuse(true);
     http.setTimeout(8000);
     http.setUserAgent("eink-color-display/1.0 (ESP32)");
     http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-    if (!http.begin(client, api)) {
+    if (!http.begin(*g_jetapi_client, api)) {
       Serial.printf("[air] jetapi %s: begin failed (attempt %d)\n",
                     registration, attempt + 1);
+      stop_jetapi_client();
       delay(300);
       continue;
     }
@@ -912,6 +998,8 @@ bool jetapi_thumbnail(const char* registration, char* out, size_t size) {
                   registration, code, http.errorToString(code).c_str(),
                   attempt + 1);
     http.end();
+    if (code >= 400 && code < 500) break;
+    if (code <= 0) stop_jetapi_client();
     delay(300);
   }
   if (code != 200 || payload.length() == 0) return false;
@@ -989,13 +1077,14 @@ bool planespotters_thumbnail(const char* registration, char* out, size_t size) {
 }
 
 bool https_get(const char* url, String& payload, uint16_t timeout_ms) {
-  WiFiClientSecure client;
-  client.setInsecure();
+  if (!jetapi_client_ensure()) return false;
   HTTPClient http;
+  http.setReuse(true);
   http.setTimeout(timeout_ms);
   http.setUserAgent("eink-color-display/1.0 (ESP32)");
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  if (!http.begin(client, url)) {
+  if (!http.begin(*g_jetapi_client, url)) {
+    stop_jetapi_client();
     return false;
   }
   const int code = http.GET();
@@ -1003,6 +1092,7 @@ bool https_get(const char* url, String& payload, uint16_t timeout_ms) {
     Serial.printf("[air] history: HTTP %d (%s)\n", code,
                   http.errorToString(code).c_str());
     http.end();
+    if (code <= 0) stop_jetapi_client();
     return false;
   }
   payload = http.getString();
@@ -1133,8 +1223,9 @@ bool download_photo(const char* url, uint8_t*& buffer, size_t capacity,
 
   buffer = (uint8_t*)malloc((size_t)size);
   if (!buffer) {
-    Serial.printf("[air] %s: body allocation failed, heap %u\n", label,
-                  (unsigned)ESP.getFreeHeap());
+    Serial.printf("[air] %s: body allocation failed, heap %u, largest %u\n",
+                  label, (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getMaxAllocHeap());
     http.end();
     return false;
   }
@@ -1271,6 +1362,7 @@ void fetch_photos(AirTrafficData& data) {
                        photo_urls[i].url, sizeof(photo_urls[i].url));
     fetch_flight_history(aircraft, data.feed_time);
   }
+  stop_jetapi_client();
 
   g_feature_valid = false;
   if (g_mode == 2 && !g_feature_photo) {
@@ -2355,6 +2447,7 @@ bool fetch_traffic(AirTrafficData& data, const AirTrafficConfig& config) {
     for (uint8_t i = 0; i < data.count && i < g_active_cards; i++) {
       resolve_route(data.aircraft[i], data.feed_time);
     }
+    stop_route_client();
     fetch_photos(data);
   }
 #endif
@@ -2402,6 +2495,185 @@ void sample_rgb332(const PhotoView& photo, int16_t dx, int16_t dy,
   r = (r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11) >> 16;
   g = (g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11) >> 16;
   b = (b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11) >> 16;
+}
+
+FeatureDitherState* feature_dither_prepare(const PhotoView& photo, int16_t px,
+                                           int16_t py, int16_t pw, int16_t ph,
+                                           int16_t start, int16_t end,
+                                           bool reverse) {
+  FeatureDitherState* st = nullptr;
+  FeatureDitherState* spare = nullptr;
+  for (uint8_t i = 0; i < kDitherStateCount; i++) {
+    FeatureDitherState& candidate = g_dither_states[i];
+    if (candidate.active && candidate.pixels == photo.pixels &&
+        candidate.px == px && candidate.py == py && candidate.pw == pw &&
+        candidate.ph == ph) {
+      st = &candidate;
+      break;
+    }
+    if (!candidate.active && !spare) spare = &candidate;
+  }
+  if (!st) {
+    st = spare ? spare : &g_dither_states[0];
+    st->pixels = photo.pixels;
+    st->px = px;
+    st->py = py;
+    st->pw = pw;
+    st->ph = ph;
+    st->active = true;
+    st->next_row = reverse ? (int16_t)(ph - 1) : 0;
+
+    const size_t needed = (size_t)pw * 3 * 2;
+    // Two error rows plus the bilinear coordinate maps for x and y. Building
+    // the maps once removes two 32-bit divisions from every output pixel.
+    const size_t bytes = needed * sizeof(int16_t) +
+                         (size_t)(pw + ph) * 2 * sizeof(uint16_t) +
+                         (size_t)(pw + ph);
+    if (st->row_values < bytes) {
+      free(st->rows);
+      st->rows = (int16_t*)malloc(bytes);
+      st->row_values = st->rows ? bytes : 0;
+      if (!st->rows) {
+        st->active = false;
+        return nullptr;
+      }
+    }
+
+    memset(st->rows, 0, needed * sizeof(int16_t));
+    st->current = st->rows;
+    st->following = st->rows + (size_t)pw * 3;
+
+    uint8_t* base = (uint8_t*)st->rows + needed * sizeof(int16_t);
+    st->x0 = (uint16_t*)base;
+    st->x1 = st->x0 + pw;
+    st->y0 = st->x1 + pw;
+    st->y1 = st->y0 + ph;
+    st->wx = (uint8_t*)(st->y1 + ph);
+    st->wy = st->wx + pw;
+    for (int16_t dx = 0; dx < pw; dx++) {
+      const int32_t fx = ((int32_t)dx * photo.width << 8) / pw;
+      const int16_t x0 = (int16_t)(fx >> 8);
+      int16_t x1 = x0 + 1;
+      if (x1 >= (int16_t)photo.width) x1 = (int16_t)photo.width - 1;
+      st->x0[dx] = (uint16_t)x0;
+      st->x1[dx] = (uint16_t)x1;
+      st->wx[dx] = (uint8_t)(fx & 0xFF);
+    }
+    for (int16_t dy = 0; dy < ph; dy++) {
+      const int32_t fy = ((int32_t)dy * photo.height << 8) / ph;
+      const int16_t y0 = (int16_t)(fy >> 8);
+      int16_t y1 = y0 + 1;
+      if (y1 >= (int16_t)photo.height) y1 = (int16_t)photo.height - 1;
+      st->y0[dy] = (uint16_t)y0;
+      st->y1[dy] = (uint16_t)y1;
+      st->wy[dy] = (uint8_t)(fy & 0xFF);
+    }
+  }
+
+  // Pages are contiguous. When a page is skipped (for example because the
+  // photo ended) the error rows no longer belong to this row, so restart.
+  const int16_t expected = reverse ? (int16_t)(end - 1) : start;
+  if (st->next_row != expected) {
+    memset(st->rows, 0, (size_t)pw * 3 * 2 * sizeof(int16_t));
+    st->current = st->rows;
+    st->following = st->rows + (size_t)pw * 3;
+  }
+  st->next_row = expected;
+  return st;
+}
+
+void dither_feature_band(epd::Display& display, const PhotoView& photo,
+                         FeatureDitherState& st, int16_t start, int16_t end,
+                         bool reverse) {
+  const int16_t px = st.px;
+  const int16_t py = st.py;
+  const int16_t pw = st.pw;
+  const int16_t ph = st.ph;
+
+  auto process_row = [&](int16_t dy) {
+    int16_t* current = st.current;
+    int16_t* following = st.following;
+    const bool has_next = reverse ? (dy > 0) : (dy + 1 < ph);
+    const uint8_t* row0 = photo.pixels + (uint32_t)st.y0[dy] * photo.width;
+    const uint8_t* row1 = photo.pixels + (uint32_t)st.y1[dy] * photo.width;
+    const int32_t wy = st.wy[dy];
+    const int32_t wyt = 256 - wy;
+    for (int16_t dx = 0; dx < pw; dx++) {
+      const uint16_t x0 = st.x0[dx];
+      const uint16_t x1 = st.x1[dx];
+      const int32_t wx = st.wx[dx];
+      const int32_t wxl = 256 - wx;
+      const uint8_t p00 = row0[x0];
+      const uint8_t p10 = row0[x1];
+      const uint8_t p01 = row1[x0];
+      const uint8_t p11 = row1[x1];
+      const int32_t top_r = kRgb3To8[(p00 >> 5) & 7] * wxl +
+                            kRgb3To8[(p10 >> 5) & 7] * wx;
+      const int32_t top_g = kRgb3To8[(p00 >> 2) & 7] * wxl +
+                            kRgb3To8[(p10 >> 2) & 7] * wx;
+      const int32_t top_b = kRgb2To8[p00 & 3] * wxl +
+                            kRgb2To8[p10 & 3] * wx;
+      const int32_t bot_r = kRgb3To8[(p01 >> 5) & 7] * wxl +
+                            kRgb3To8[(p11 >> 5) & 7] * wx;
+      const int32_t bot_g = kRgb3To8[(p01 >> 2) & 7] * wxl +
+                            kRgb3To8[(p11 >> 2) & 7] * wx;
+      const int32_t bot_b = kRgb2To8[p01 & 3] * wxl +
+                            kRgb2To8[p11 & 3] * wx;
+      const int r = (int)((top_r * wyt + bot_r * wy) >> 16);
+      const int g = (int)((top_g * wyt + bot_g * wy) >> 16);
+      const int b = (int)((top_b * wyt + bot_b * wy) >> 16);
+      const size_t e = (size_t)dx * 3;
+      int rr = r + current[e];
+      int gg = g + current[e + 1];
+      int bb = b + current[e + 2];
+      if (rr < 0) rr = 0;
+      if (rr > 255) rr = 255;
+      if (gg < 0) gg = 0;
+      if (gg > 255) gg = 255;
+      if (bb < 0) bb = 0;
+      if (bb > 255) bb = 255;
+
+      const uint8_t index = photo_nearest_index(
+          (uint8_t)rr, (uint8_t)gg, (uint8_t)bb);
+      const int er = rr - kPhotoPalette[index][0];
+      const int eg = gg - kPhotoPalette[index][1];
+      const int eb = bb - kPhotoPalette[index][2];
+
+      if (dx + 1 < pw) {
+        current[e + 3] += (int16_t)(er * 7 / 16);
+        current[e + 4] += (int16_t)(eg * 7 / 16);
+        current[e + 5] += (int16_t)(eb * 7 / 16);
+      }
+      if (has_next) {
+        if (dx > 0) {
+          following[e - 3] += (int16_t)(er * 3 / 16);
+          following[e - 2] += (int16_t)(eg * 3 / 16);
+          following[e - 1] += (int16_t)(eb * 3 / 16);
+        }
+        following[e] += (int16_t)(er * 5 / 16);
+        following[e + 1] += (int16_t)(eg * 5 / 16);
+        following[e + 2] += (int16_t)(eb * 5 / 16);
+        if (dx + 1 < pw) {
+          following[e + 3] += (int16_t)(er * 1 / 16);
+          following[e + 4] += (int16_t)(eg * 1 / 16);
+          following[e + 5] += (int16_t)(eb * 1 / 16);
+        }
+      }
+
+      display.drawPixel(px + dx, py + dy, kPhotoColors[index]);
+    }
+    st.current = following;
+    st.following = current;
+    memset(st.following, 0, (size_t)pw * 3 * sizeof(int16_t));
+  };
+
+  if (reverse) {
+    for (int16_t dy = end - 1; dy >= start; dy--) process_row(dy);
+    st.next_row = (int16_t)(start - 1);
+  } else {
+    for (int16_t dy = start; dy < end; dy++) process_row(dy);
+    st.next_row = end;
+  }
 }
 
 void draw_photo(epd::Display& display, const PhotoView& photo, int16_t box_x,
@@ -2454,13 +2726,17 @@ void draw_photo(epd::Display& display, const PhotoView& photo, int16_t box_x,
 
   {
     // Sample the smooth RGB332 image with bilinear interpolation, then run
-    // Floyd-Steinberg to the six inks at the final display resolution. This
-    // avoids resampling an already-dithered bitmap and keeps the aircraft
-    // edges clean while still mixing the limited palette.
-    const size_t error_values = (size_t)pw * 3 * 2;
-    int16_t* errors =
-        (int16_t*)malloc(error_values * sizeof(int16_t));
-    if (!errors) {
+    // Floyd-Steinberg to the six inks at the final display resolution. The
+    // error rows are carried from page to page so each pixel is diffused once.
+    const uint32_t dither_start = millis();
+    // With EPD_ROTATE_180 the panel pages are drawn bottom-up, so diffuse in
+    // that direction; otherwise the pages arrive top-down.
+    const bool reverse = EPD_ROTATE_180 != 0;
+    FeatureDitherState* state =
+        feature_dither_prepare(photo, px, py, pw, ph, start, end, reverse);
+    if (state) {
+      dither_feature_band(display, photo, *state, start, end, reverse);
+    } else {
       for (int16_t dy = start; dy < end; dy++) {
         for (int16_t dx = 0; dx < pw; dx++) {
           int r, g, b;
@@ -2470,64 +2746,8 @@ void draw_photo(epd::Display& display, const PhotoView& photo, int16_t box_x,
           display.drawPixel(px + dx, py + dy, kPhotoColors[index]);
         }
       }
-      return;
     }
-    memset(errors, 0, error_values * sizeof(int16_t));
-    int16_t* current = errors;
-    int16_t* following = errors + (size_t)pw * 3;
-
-    for (int16_t dy = 0; dy < ph; dy++) {
-      for (int16_t dx = 0; dx < pw; dx++) {
-        int r, g, b;
-        sample_rgb332(photo, dx, dy, pw, ph, r, g, b);
-        const size_t e = (size_t)dx * 3;
-        int rr = r + current[e];
-        int gg = g + current[e + 1];
-        int bb = b + current[e + 2];
-        if (rr < 0) rr = 0;
-        if (rr > 255) rr = 255;
-        if (gg < 0) gg = 0;
-        if (gg > 255) gg = 255;
-        if (bb < 0) bb = 0;
-        if (bb > 255) bb = 255;
-
-        const uint8_t index = photo_nearest_index(
-            (uint8_t)rr, (uint8_t)gg, (uint8_t)bb);
-        const int er = rr - kPhotoPalette[index][0];
-        const int eg = gg - kPhotoPalette[index][1];
-        const int eb = bb - kPhotoPalette[index][2];
-
-        if (dx + 1 < pw) {
-          current[e + 3] += (int16_t)(er * 7 / 16);
-          current[e + 4] += (int16_t)(eg * 7 / 16);
-          current[e + 5] += (int16_t)(eb * 7 / 16);
-        }
-        if (dy + 1 < ph) {
-          if (dx > 0) {
-            following[e - 3] += (int16_t)(er * 3 / 16);
-            following[e - 2] += (int16_t)(eg * 3 / 16);
-            following[e - 1] += (int16_t)(eb * 3 / 16);
-          }
-          following[e] += (int16_t)(er * 5 / 16);
-          following[e + 1] += (int16_t)(eg * 5 / 16);
-          following[e + 2] += (int16_t)(eb * 5 / 16);
-          if (dx + 1 < pw) {
-            following[e + 3] += (int16_t)(er * 1 / 16);
-            following[e + 4] += (int16_t)(eg * 1 / 16);
-            following[e + 5] += (int16_t)(eb * 1 / 16);
-          }
-        }
-
-        if (dy >= start && dy < end) {
-          display.drawPixel(px + dx, py + dy, kPhotoColors[index]);
-        }
-      }
-      int16_t* swap = current;
-      current = following;
-      following = swap;
-      memset(following, 0, (size_t)pw * 3 * sizeof(int16_t));
-    }
-    free(errors);
+    g_photo_dither_ms += millis() - dither_start;
   }
 }
 
@@ -2974,7 +3194,7 @@ void draw_polyline_table(const MapPolyline* table, uint16_t count,
   }
 }
 
-void fill_ocean() {
+void fill_ocean_slow() {
   const int32_t lon_span = g_q_lon_max - g_q_lon_min;
   const int32_t lat_span = g_q_lat_max - g_q_lat_min;
   if (lon_span <= 0 || lat_span <= 0) return;
@@ -3024,6 +3244,117 @@ void fill_ocean() {
   }
 }
 
+constexpr int16_t kOceanChunkRows = 60;
+constexpr uint16_t kOceanPoolSize = 2048;  // int16 crossings per chunk
+// Allocated at boot only on map wakes: this keeps the photo modes' heap intact
+// and gives the map a contiguous pool before Wi-Fi fragments the heap.
+int16_t* g_ocean_pool = nullptr;
+
+template <typename Emit>
+void scan_ocean_edges(int16_t row_begin, int16_t row_end, Emit emit) {
+  for (uint16_t r = 0; r < kOceanRingCount; r++) {
+    const MapPolyline& ring = kOceanRings[r];
+    if (ring.max_lon < g_q_lon_min || ring.min_lon > g_q_lon_max ||
+        ring.max_lat < g_q_lat_min || ring.min_lat > g_q_lat_max) {
+      continue;
+    }
+    const int16_t* points = &kVectorMapPoints[ring.offset * 2];
+    int32_t previous_x = map_project_x(points[0]);
+    int32_t previous_y = map_project_y(points[1]);
+    for (uint16_t i = 1; i < ring.count; i++) {
+      const int32_t x = map_project_x(points[i * 2]);
+      const int32_t y = map_project_y(points[i * 2 + 1]);
+      if (previous_y != y) {
+        int16_t y_start = (int16_t)(previous_y < y ? previous_y : y);
+        int16_t y_end = (int16_t)(previous_y < y ? y : previous_y);
+        if (y_start < row_begin) y_start = row_begin;
+        if (y_end >= row_end) y_end = (int16_t)(row_end - 1);
+        const int32_t dy = y - previous_y;
+        for (int16_t sy = y_start; sy <= y_end; sy++) {
+          const float yy = (float)sy + 0.5f;
+          if ((previous_y <= yy && y > yy) ||
+              (y <= yy && previous_y > yy)) {
+            const float t = (yy - (float)previous_y) / (float)dy;
+            const int32_t x_at =
+                (int32_t)lroundf((float)previous_x +
+                                 t * (float)(x - previous_x));
+            emit(sy, (int16_t)x_at);
+          }
+        }
+      }
+      previous_x = x;
+      previous_y = y;
+    }
+  }
+}
+
+void fill_ocean() {
+  if (!g_ocean_pool) {
+    fill_ocean_slow();
+    return;
+  }
+  // Fill in 60-row bands so a 4 KB pool holds every crossing in the
+  // band. The previous one-pass slot table silently dropped up to 2,260
+  // crossings; this keeps all of them without a large heap allocation that can
+  // fail after the map buffer fragments the heap.
+  uint32_t grand_total = 0;
+  uint16_t max_count = 0;
+
+  for (int16_t chunk = 0; chunk < kMapBufferH; chunk += kOceanChunkRows) {
+    const int16_t rows =
+        (int16_t)((chunk + kOceanChunkRows <= kMapBufferH)
+                      ? kOceanChunkRows
+                      : kMapBufferH - chunk);
+    uint16_t counts[kOceanChunkRows];
+    memset(counts, 0, (size_t)rows * sizeof(uint16_t));
+
+    scan_ocean_edges(chunk, (int16_t)(chunk + rows),
+                     [&](int16_t sy, int16_t) { counts[sy - chunk]++; });
+
+    uint32_t total = 0;
+    uint16_t band_max = 0;
+    for (int16_t i = 0; i < rows; i++) {
+      total += counts[i];
+      if (counts[i] > band_max) band_max = counts[i];
+    }
+    if (band_max > max_count) max_count = band_max;
+    grand_total += total;
+    if (total == 0) continue;
+    if (total > kOceanPoolSize) {
+      Serial.printf("[air] map fill: band needs %u crossings, using slow "
+                    "fill\n",
+                    (unsigned)total);
+      fill_ocean_slow();
+      return;
+    }
+
+    uint16_t starts[kOceanChunkRows + 1];
+    uint16_t cursor[kOceanChunkRows];
+    starts[0] = 0;
+    for (int16_t i = 0; i < rows; i++) {
+      starts[i + 1] = (uint16_t)(starts[i] + counts[i]);
+    }
+    memset(cursor, 0, (size_t)rows * sizeof(uint16_t));
+    scan_ocean_edges(chunk, (int16_t)(chunk + rows),
+                     [&](int16_t sy, int16_t x) {
+                       const int16_t row = (int16_t)(sy - chunk);
+                       g_ocean_pool[starts[row] + cursor[row]++] = x;
+                     });
+
+    for (int16_t i = 0; i < rows; i++) {
+      const uint16_t count = counts[i];
+      if (count < 2) continue;
+      int16_t* row = g_ocean_pool + starts[i];
+      std::sort(row, row + count);
+      for (uint16_t j = 0; j + 1 < count; j += 2) {
+        map_fill_span((int16_t)(chunk + i), row[j], row[j + 1], 1);
+      }
+    }
+  }
+  Serial.printf("[air] map fill: %u crossings, max %u/row\n",
+                (unsigned)grand_total, (unsigned)max_count);
+}
+
 void draw_map_places() {
   for (uint16_t i = 0; i < kMapPlaceCount; i++) {
     const MapPlace& place = kMapPlaces[i];
@@ -3065,6 +3396,30 @@ bool prepare_vector_map(const AirTrafficData& data) {
   if (g_q_lon_max <= g_q_lon_min || g_q_lat_max <= g_q_lat_min) return false;
   g_map_m_per_px = 2.0f * half_lat * 111320.0f / (float)kMapDisplayH;
 
+  g_visible_place_count = 0;
+  for (uint16_t i = 0; i < kMapPlaceCount && g_visible_place_count < 32;
+       i++) {
+    const MapPlace& place = kMapPlaces[i];
+    if (place.rank > 8) continue;
+    if (place.lon < g_q_lon_min || place.lon > g_q_lon_max ||
+        place.lat < g_q_lat_min || place.lat > g_q_lat_max) {
+      continue;
+    }
+    g_visible_places[g_visible_place_count++] = i;
+  }
+  g_visible_district_count = 0;
+  for (uint16_t i = 0; i < kDistrictLabelCount &&
+                       g_visible_district_count < 16;
+       i++) {
+    const MapPlace& district = kDistrictLabels[i];
+    if (district.rank > 5) continue;
+    if (district.lon < g_q_lon_min || district.lon > g_q_lon_max ||
+        district.lat < g_q_lat_min || district.lat > g_q_lat_max) {
+      continue;
+    }
+    g_visible_districts[g_visible_district_count++] = i;
+  }
+
   if (!g_map_blocks[0]) {
     bool allocated = true;
     for (uint8_t i = 0; i < kMapBlockCount; i++) {
@@ -3088,12 +3443,23 @@ bool prepare_vector_map(const AirTrafficData& data) {
   }
   const uint32_t started = millis();
   fill_ocean();
+  const uint32_t t_fill = millis();
   // District boundaries first, then country borders and coastlines on top.
   draw_polyline_table(kDistrictLines, kDistrictLineCount, 2);
+  const uint32_t t_district = millis();
   draw_polyline_table(kBorderLines, kBorderLineCount, 3);
+  const uint32_t t_border = millis();
   draw_polyline_table(kOceanRings, kOceanRingCount, 3);
+  const uint32_t t_coast = millis();
   draw_polyline_table(kRiverLines, kRiverLineCount, 1, true);
   draw_map_places();
+  const uint32_t t_done = millis();
+  Serial.printf("[air] map timing: fill %lu, district %lu, border %lu, coast %lu, rest %lu\n",
+                (unsigned long)(t_fill - started),
+                (unsigned long)(t_district - t_fill),
+                (unsigned long)(t_border - t_district),
+                (unsigned long)(t_coast - t_border),
+                (unsigned long)(t_done - t_coast));
   g_map_ready = true;
   Serial.printf("[air] vector map q=%ld..%ld, %ld..%ld in %lu ms, heap %u\n",
                 (long)g_q_lon_min, (long)g_q_lon_max, (long)g_q_lat_min,
@@ -3167,7 +3533,13 @@ void draw_real_map_background(epd::Display& display, int16_t page_top,
              map_pixel((int16_t)(x + run), sy) == index) {
         run++;
       }
-      display.drawFastHLine(x, y, run, kMapColors[index]);
+      // Adafruit's drawFastHLine goes through a virtual writePixel call for
+      // every pixel. drawPixel on the concrete display is inlined, which is
+      // faster for these short runs.
+      const uint16_t color = kMapColors[index];
+      for (int16_t i = 0; i < run; i++) {
+        display.drawPixel((int16_t)(x + i), y, color);
+      }
       x = (int16_t)(x + run);
     }
   }
@@ -3212,13 +3584,9 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
   uint8_t used_count = 0;
 
   uint8_t district_labels = 0;
-  for (uint16_t i = 0; i < kDistrictLabelCount && district_labels < 8; i++) {
-    const MapPlace& district = kDistrictLabels[i];
-    if (district.rank > 5) continue;
-    if (district.lon < g_q_lon_min || district.lon > g_q_lon_max ||
-        district.lat < g_q_lat_min || district.lat > g_q_lat_max) {
-      continue;
-    }
+  for (uint8_t v = 0;
+       v < g_visible_district_count && district_labels < 8; v++) {
+    const MapPlace& district = kDistrictLabels[g_visible_districts[v]];
     const int16_t x = (int16_t)map_display_x(district.lon);
     const int16_t y = (int16_t)map_display_y(district.lat);
     if (x < 8 || x > kMapDisplayW - 8 || y < 38 || y > 458) continue;
@@ -3241,13 +3609,8 @@ void draw_real_map_overlay(epd::Display& display, const AirTrafficData& data,
   }
 
   uint8_t city_labels = 0;
-  for (uint16_t i = 0; i < kMapPlaceCount && city_labels < 10; i++) {
-    const MapPlace& place = kMapPlaces[i];
-    if (place.rank > 8) continue;
-    if (place.lon < g_q_lon_min || place.lon > g_q_lon_max ||
-        place.lat < g_q_lat_min || place.lat > g_q_lat_max) {
-      continue;
-    }
+  for (uint8_t v = 0; v < g_visible_place_count && city_labels < 10; v++) {
+    const MapPlace& place = kMapPlaces[g_visible_places[v]];
     int16_t x = (int16_t)map_display_x(place.lon);
     int16_t y = (int16_t)map_display_y(place.lat);
     if (x < 8 || x > kMapDisplayW - 8 || y < 38 || y > 458) continue;
@@ -3405,6 +3768,8 @@ void render_traffic(epd::Display& display, const AirTrafficData& data) {
     Serial.flush();
   }
 #endif
+  g_photo_dither_ms = 0;
+  const uint32_t page_loop_start = millis();
   display.firstPage();
   uint8_t physical_page = 0;
   do {
@@ -3419,6 +3784,14 @@ void render_traffic(epd::Display& display, const AirTrafficData& data) {
     draw_poster_page(display, page);
     physical_page++;
   } while (display.nextPage());
+  Serial.printf("[air] page loop %lu ms, photo dither %lu ms\n",
+                (unsigned long)(millis() - page_loop_start),
+                (unsigned long)g_photo_dither_ms);
+  Serial.flush();
+  for (FeatureDitherState& state : g_dither_states) {
+    free(state.rows);
+    state = {};
+  }
 }
 
 #if AIR_TRAFFIC_INCLUDE_DEMO
@@ -3486,8 +3859,20 @@ void hibernate_and_sleep(epd::Display& display) {
 
 void airTrafficRun(epd::Display& display) {
   init_view_mode();
-  Serial.printf("[air] view mode %u\n", (unsigned)g_mode);
+  Serial.printf("[air] view mode %u, boot %lu ms\n", (unsigned)g_mode,
+                (unsigned long)millis());
   Serial.flush();
+
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_MODE == 6
+  if (g_mode == 6) {
+    g_ocean_pool =
+        (int16_t*)malloc((size_t)kOceanPoolSize * sizeof(int16_t));
+    if (!g_ocean_pool) {
+      Serial.printf("[air] map fill pool: allocation failed, heap %u\n",
+                    (unsigned)ESP.getFreeHeap());
+    }
+  }
+#endif
 
 #if AIR_TRAFFIC_INCLUDE_DEMO
   if (g_mode == 1) {
@@ -3584,6 +3969,8 @@ void airTrafficRun(epd::Display& display) {
   Serial.flush();
   if (fetched) {
     const uint32_t start = millis();
+    Serial.printf("[air] fetch done at %lu ms\n", (unsigned long)start);
+    Serial.flush();
     render_traffic(display, *data);
     Serial.printf("[air] render total %lu ms (panel %lu ms)\n",
                   (unsigned long)(millis() - start),
