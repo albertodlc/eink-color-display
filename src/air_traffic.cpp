@@ -23,7 +23,7 @@
 #include "air_traffic_config.h"
 #include "fallback_photos.h"
 #include "flags.h"
-#if AIR_TRAFFIC_MODE == 6
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_MODE == 6
 #include "vector_map.h"
 #endif
 
@@ -56,7 +56,7 @@ constexpr int16_t kPhotoH = 128;
 constexpr uint16_t kPhotoBytes = (kPhotoW * kPhotoH * 3 + 7) / 8 + 2;
 constexpr size_t kJpegBufferSize = 32 * 1024;
 
-#if AIR_TRAFFIC_MODE == 6
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_MODE == 6
 // The map is rendered from Natural Earth 1:50m vectors into a 2-bit buffer at
 // the panel resolution. The buffer uses four inks: land, water, borders and
 // coastlines. There are no raster map tiles or tile-service labels.
@@ -112,6 +112,52 @@ struct PhotoView {
   PhotoFormat format;
 };
 
+uint8_t g_mode = AIR_TRAFFIC_MODE;
+uint8_t g_active_cards = 4;
+
+uint8_t mode_active_cards(uint8_t mode) {
+  switch (mode) {
+    case 1: {
+      uint8_t count = AIR_TRAFFIC_DEMO_COUNT;
+      if (count < 1) count = 1;
+      if (count > AIR_TRAFFIC_PAGE_AIRCRAFT) count = AIR_TRAFFIC_PAGE_AIRCRAFT;
+      return count;
+    }
+    case 2: return 1;
+    case 3: return 2;
+    case 4: return 3;
+    case 5: return AIR_TRAFFIC_PAGE_AIRCRAFT;
+    case 6: return 1;  // map mode does not fetch cards
+    default: return 4;
+  }
+}
+
+#if AIR_TRAFFIC_CYCLE_MODES
+constexpr uint8_t kCycleModes[] = {AIR_TRAFFIC_CYCLE_SEQUENCE};
+constexpr uint8_t kCycleModeCount =
+    (uint8_t)(sizeof(kCycleModes) / sizeof(kCycleModes[0]));
+static_assert(kCycleModeCount > 0, "AIR_TRAFFIC_CYCLE_SEQUENCE is empty");
+constexpr uint32_t kCycleMagic = 0x434D4F44;  // "CMOD"
+RTC_DATA_ATTR uint32_t g_cycle_magic = 0;
+RTC_DATA_ATTR uint8_t g_cycle_index = 0;
+#endif
+
+void init_view_mode() {
+#if AIR_TRAFFIC_CYCLE_MODES
+  if (g_cycle_magic != kCycleMagic || g_cycle_index >= kCycleModeCount) {
+    g_cycle_index = 0;
+    g_cycle_magic = kCycleMagic;
+  } else {
+    g_cycle_index = (uint8_t)((g_cycle_index + 1) % kCycleModeCount);
+  }
+  g_mode = kCycleModes[g_cycle_index];
+#else
+  g_mode = AIR_TRAFFIC_MODE;
+#endif
+  if (g_mode > 6) g_mode = AIR_TRAFFIC_MODE;
+  g_active_cards = mode_active_cards(g_mode);
+}
+
 // Allocate each 15 KB packed card separately. The heap is fragmented after
 // Wi-Fi/TLS, so this is much more reliable than one large block.
 PhotoCard* g_photos[AIR_TRAFFIC_PAGE_AIRCRAFT] = {};
@@ -141,7 +187,7 @@ RTC_DATA_ATTR FlightHistory g_flight_history;
 
 bool ensure_photo_store() {
   bool ok = true;
-  for (uint8_t i = 0; i < AIR_TRAFFIC_ACTIVE_CARDS; i++) {
+  for (uint8_t i = 0; i < g_active_cards; i++) {
     if (!g_photos[i]) {
       g_photos[i] = (PhotoCard*)malloc(sizeof(PhotoCard));
     }
@@ -919,7 +965,8 @@ bool https_get(const char* url, String& payload, uint16_t timeout_ms) {
 }
 
 void fetch_flight_history(const AirTrafficAircraft& aircraft, uint32_t now) {
-#if AIR_TRAFFIC_MODE == 2
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_MODE == 2
+  if (g_mode != 2) return;
   if (!aircraft.registration[0]) return;
 
   const bool valid_cache = g_flight_history.magic == kFlightHistoryMagic;
@@ -1168,7 +1215,7 @@ void fetch_photos(AirTrafficData& data) {
   // The TLS handshake for JetAPI/Planespotters needs more headroom than the
   // image downloads that follow.
   static PhotoUrl photo_urls[AIR_TRAFFIC_PAGE_AIRCRAFT];
-  for (uint8_t i = 0; i < AIR_TRAFFIC_ACTIVE_CARDS; i++) {
+  for (uint8_t i = 0; i < g_active_cards; i++) {
     photo_urls[i].valid = false;
     if (i >= data.count) continue;
     AirTrafficAircraft& aircraft = data.aircraft[i];
@@ -1186,11 +1233,11 @@ void fetch_photos(AirTrafficData& data) {
   }
   Serial.printf("[air] photo buffers: heap %u\n",
                 (unsigned)ESP.getFreeHeap());
-  for (uint8_t i = 0; i < AIR_TRAFFIC_ACTIVE_CARDS; i++) {
+  for (uint8_t i = 0; i < g_active_cards; i++) {
     if (g_photos[i]) g_photos[i]->valid = false;
   }
 
-  for (uint8_t i = 0; i < data.count && i < AIR_TRAFFIC_ACTIVE_CARDS; i++) {
+  for (uint8_t i = 0; i < data.count && i < g_active_cards; i++) {
     if (!photo_urls[i].valid) continue;
     AirTrafficAircraft& aircraft = data.aircraft[i];
 
@@ -2055,18 +2102,22 @@ class AdsbFeedReader {
       if (lat == 0.0 && lon == 0.0) return;
       distance_bearing(config.lat, config.lon, lat, lon, km, bearing);
     }
-#if AIR_TRAFFIC_MODE == 6
-    // Map mode loads everything inside the visible map rectangle, including
-    // aircraft outside the configured radius.
-    const float half_lat = (float)config.radius_km * 1.1f / 111.32f;
-    float cos_lat = cosf((float)config.lat * PI / 180.0f);
-    if (cos_lat < 0.05f) cos_lat = 0.05f;
-    const float half_lon =
-        half_lat * (float)epd::kWidth / (float)epd::kHeight / cos_lat;
-    if (lat == 0.0 && lon == 0.0) {
-      if (km > (float)config.radius_km * 2.2f) return;
-    } else if (fabs(lat - config.lat) > half_lat ||
-               fabs(lon - config.lon) > half_lon) {
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_MODE == 6
+    if (g_mode == 6) {
+      // Map mode loads everything inside the visible map rectangle, including
+      // aircraft outside the configured radius.
+      const float half_lat = (float)config.radius_km * 1.1f / 111.32f;
+      float cos_lat = cosf((float)config.lat * PI / 180.0f);
+      if (cos_lat < 0.05f) cos_lat = 0.05f;
+      const float half_lon =
+          half_lat * (float)epd::kWidth / (float)epd::kHeight / cos_lat;
+      if (lat == 0.0 && lon == 0.0) {
+        if (km > (float)config.radius_km * 2.2f) return;
+      } else if (fabs(lat - config.lat) > half_lat ||
+                 fabs(lon - config.lon) > half_lon) {
+        return;
+      }
+    } else if (km > config.radius_km + 0.5f) {
       return;
     }
 #else
@@ -2163,10 +2214,12 @@ bool fetch_traffic(AirTrafficData& data, const AirTrafficConfig& config) {
   }
 
   int query_radius_km = config.radius_km;
-#if AIR_TRAFFIC_MODE == 6
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_MODE == 6
   // The map view is a 5:3 rectangle, so its corners are farther than the
   // configured radius. Query the covering circle and filter to the grid below.
-  query_radius_km = (int)ceilf((float)config.radius_km * 2.2f);
+  if (g_mode == 6) {
+    query_radius_km = (int)ceilf((float)config.radius_km * 2.2f);
+  }
 #endif
   const int nm = (int)ceilf(query_radius_km / 1.852f);
   char url[160];
@@ -2233,17 +2286,24 @@ bool fetch_traffic(AirTrafficData& data, const AirTrafficConfig& config) {
               return a.distance_km < b.distance_km;
             });
   data.ok = true;
-#if AIR_TRAFFIC_MODE != 6
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_MODE != 6
   // Routes first while the heap is still roomy; photos need the large working
   // buffers and are fetched afterwards. Map mode needs neither.
-  for (uint8_t i = 0; i < data.count && i < AIR_TRAFFIC_ACTIVE_CARDS; i++) {
-    resolve_route(data.aircraft[i], data.feed_time);
+  if (g_mode != 6) {
+    for (uint8_t i = 0; i < data.count && i < g_active_cards; i++) {
+      resolve_route(data.aircraft[i], data.feed_time);
+    }
+    fetch_photos(data);
   }
-  fetch_photos(data);
 #endif
-#if AIR_TRAFFIC_MODE == 6
-  Serial.printf("[air] %u aircraft in map view (%u stored)\n",
-                data.total_within_radius, data.count);
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_MODE == 6
+  if (g_mode == 6) {
+    Serial.printf("[air] %u aircraft in map view (%u stored)\n",
+                  data.total_within_radius, data.count);
+  } else {
+    Serial.printf("[air] %u aircraft within %d km (%u stored)\n",
+                  data.total_within_radius, config.radius_km, data.count);
+  }
 #else
   Serial.printf("[air] %u aircraft within %d km (%u stored)\n",
                 data.total_within_radius, config.radius_km, data.count);
@@ -2419,8 +2479,8 @@ struct PosterCard {
 };
 
 uint8_t build_layout(const AirTrafficData& data, PosterCard* cards) {
-  const uint8_t shown = data.count > AIR_TRAFFIC_ACTIVE_CARDS
-                            ? AIR_TRAFFIC_ACTIVE_CARDS
+  const uint8_t shown = data.count > g_active_cards
+                            ? g_active_cards
                             : data.count;
   if (shown == 0) return 0;
   if (shown == 1) {
@@ -2496,7 +2556,8 @@ void draw_card(epd::Display& display, const PosterCard& card,
                  page_top, page_bottom);
     }
 
-#if AIR_TRAFFIC_MODE == 2
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_MODE == 2
+    if (g_mode == 2) {
     // Two columns: current flight on the left, the aircraft's latest routes
     // from FlightRadar24 on the right. The photo keeps its full width above.
     const int16_t text_top = card.y + 326;
@@ -2541,6 +2602,23 @@ void draw_card(epd::Display& display, const PosterCard& card,
         draw_centered_fit(display, right_x, text_top + 28 + i * 20, right_w,
                           line, 2, 1, GxEPD_BLACK);
       }
+    }
+    } else {
+    draw_flight_and_type(display, card.x, card.y + 326, card.w,
+                         aircraft.callsign, aircraft.type_name, 3, 2);
+    draw_flight_details(display, card.x, card.y + 354, card.w, altitude,
+                        last_line, 2);
+
+    char registration[64];
+    format_registration_line(aircraft, registration, sizeof(registration));
+    if (registration[0]) {
+      draw_registration_line(display, card.x, card.y + 382, card.w,
+                             registration, registration_flag);
+      if (registration_flag != kFlagNone) {
+        draw_centered(display, card.x, card.y + 404, card.w,
+                      kFlagNames[registration_flag], 1, GxEPD_BLACK);
+      }
+    }
     }
 #else
     draw_flight_and_type(display, card.x, card.y + 326, card.w,
@@ -2596,14 +2674,20 @@ void draw_header(epd::Display& display, const AirTrafficData& data) {
   // N counts every aircraft in the selected area (the radius for poster modes,
   // the map rectangle for map mode), not just the nearest stored ones.
   char title[80];
-#if AIR_TRAFFIC_MODE == 6
-  if (data.count < data.total_within_radius) {
-    snprintf(title, sizeof(title),
-             "MAP VIEW - %u OF %u AIRCRAFT IN THE AIR NOW",
-             (unsigned)data.count, (unsigned)data.total_within_radius);
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_MODE == 6
+  if (g_mode == 6) {
+    if (data.count < data.total_within_radius) {
+      snprintf(title, sizeof(title),
+               "MAP VIEW - %u OF %u AIRCRAFT IN THE AIR NOW",
+               (unsigned)data.count, (unsigned)data.total_within_radius);
+    } else {
+      snprintf(title, sizeof(title), "MAP VIEW - %u AIRCRAFT IN THE AIR NOW",
+               (unsigned)data.count);
+    }
   } else {
-    snprintf(title, sizeof(title), "MAP VIEW - %u AIRCRAFT IN THE AIR NOW",
-             (unsigned)data.count);
+    snprintf(title, sizeof(title),
+             "WITHIN %.0f KM - %u AIRCRAFT IN THE AIR NOW", data.radius_km,
+             (unsigned)data.total_within_radius);
   }
 #else
   snprintf(title, sizeof(title),
@@ -2639,7 +2723,7 @@ void draw_empty_page(epd::Display& display, const AirTrafficData& data) {
   draw_centered(display, 0, 250, epd::kWidth, sub, 2, GxEPD_BLACK);
 }
 
-#if AIR_TRAFFIC_MODE == 6
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_MODE == 6
 void draw_plane_symbol(epd::Display& display, int16_t x, int16_t y,
                        int heading_deg, uint16_t color) {
   const float rad = heading_deg * PI / 180.0f;
@@ -3186,13 +3270,18 @@ void draw_poster_page(epd::Display& display, uint8_t page) {
   int16_t page_bottom = page_top + display.pageHeight();
   if (page_bottom > display.height()) page_bottom = display.height();
 
-#if AIR_TRAFFIC_MODE == 6
-  draw_map_page(display, data, page_top, page_bottom);
-  if (intersects(0, kHeaderRuleY + 2, page_top, page_bottom)) {
-    display.fillRect(0, 0, epd::kWidth, kHeaderRuleY + 2, GxEPD_WHITE);
-    draw_header(display, data);
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_MODE == 6
+  if (g_mode == 6) {
+    draw_map_page(display, data, page_top, page_bottom);
+    if (intersects(0, kHeaderRuleY + 2, page_top, page_bottom)) {
+      display.fillRect(0, 0, epd::kWidth, kHeaderRuleY + 2, GxEPD_WHITE);
+      draw_header(display, data);
+    }
+    return;
   }
-#else
+#endif
+
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_MODE != 6
   if (intersects(0, kHeaderRuleY + 2, page_top, page_bottom)) {
     draw_header(display, data);
   }
@@ -3218,25 +3307,27 @@ void draw_poster_page(epd::Display& display, uint8_t page) {
 
 void render_traffic(epd::Display& display, const AirTrafficData& data) {
   g_traffic = &data;
-#if AIR_TRAFFIC_MODE == 2
-  if (data.count > 0) {
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_MODE == 2
+  if (g_mode == 2 && data.count > 0) {
     const FlagId flag = flag_for_registration(data.aircraft[0].registration);
     Serial.printf("[air] flag %s: %s\n", data.aircraft[0].registration,
                   flag == kFlagNone ? "none" : kFlagNames[flag]);
     Serial.flush();
   }
 #endif
-#if AIR_TRAFFIC_MODE == 6
-  Serial.printf("[air] map %.5f, %.5f radius %.0f km, %u aircraft\n", data.lat,
-                data.lon, data.radius_km, (unsigned)data.count);
-  for (uint8_t i = 0; i < data.count; i++) {
-    const AirTrafficAircraft& aircraft = data.aircraft[i];
-    Serial.printf("[air] map %s: %d km / %d deg, heading %d\n",
-                  aircraft.callsign, aircraft.distance_km,
-                  aircraft.bearing_deg, aircraft.heading_deg);
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_MODE == 6
+  if (g_mode == 6) {
+    Serial.printf("[air] map %.5f, %.5f radius %.0f km, %u aircraft\n",
+                  data.lat, data.lon, data.radius_km, (unsigned)data.count);
+    for (uint8_t i = 0; i < data.count; i++) {
+      const AirTrafficAircraft& aircraft = data.aircraft[i];
+      Serial.printf("[air] map %s: %d km / %d deg, heading %d\n",
+                    aircraft.callsign, aircraft.distance_km,
+                    aircraft.bearing_deg, aircraft.heading_deg);
+    }
+    prepare_vector_map(data);
+    Serial.flush();
   }
-  prepare_vector_map(data);
-  Serial.flush();
 #endif
   display.firstPage();
   uint8_t physical_page = 0;
@@ -3254,7 +3345,7 @@ void render_traffic(epd::Display& display, const AirTrafficData& data) {
   } while (display.nextPage());
 }
 
-#if AIR_TRAFFIC_DEMO
+#if AIR_TRAFFIC_INCLUDE_DEMO
 void fill_demo_data(AirTrafficData& data) {
   struct DemoAircraft {
     const char* callsign;
@@ -3318,34 +3409,54 @@ void hibernate_and_sleep(epd::Display& display) {
 }  // namespace
 
 void airTrafficRun(epd::Display& display) {
-#if AIR_TRAFFIC_DEMO
-  static AirTrafficData demo;
-  fill_demo_data(demo);
-
-  // The demo normally has no network path. Try the saved Wi-Fi credentials
-  // briefly so the four cards can use real JetAPI photos; if that fails, the
-  // bundled fallback photos are used.
-  WiFi.mode(WIFI_STA);
-  WiFi.begin();
-  const uint32_t wifi_start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifi_start < 10000) {
-    delay(200);
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    fetch_photos(demo);
-    WiFi.disconnect(true);
-  }
-
-  Serial.printf("[air] demo feed: %u aircraft\n", demo.count);
+  init_view_mode();
+  Serial.printf("[air] view mode %u\n", (unsigned)g_mode);
   Serial.flush();
-  const uint32_t demo_start = millis();
-  render_traffic(display, demo);
-  Serial.printf("[air] demo render total %lu ms (panel %lu ms)\n",
-                (unsigned long)(millis() - demo_start),
-                (unsigned long)display.epd2.lastRefreshMs());
-  Serial.flush();
-  display.hibernate();
-  return;
+
+#if AIR_TRAFFIC_INCLUDE_DEMO
+  if (g_mode == 1) {
+    AirTrafficData* demo = (AirTrafficData*)calloc(1, sizeof(AirTrafficData));
+    if (!demo) {
+      render_error_page(display, "Out of memory");
+      display.hibernate();
+      return;
+    }
+    fill_demo_data(*demo);
+
+    // The demo normally has no network path. Try the saved Wi-Fi credentials
+    // briefly so the cards can use real JetAPI photos; if that fails, the
+    // bundled fallback photos are used.
+    WiFi.mode(WIFI_STA);
+    WiFi.begin();
+    const uint32_t wifi_start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - wifi_start < 10000) {
+      delay(200);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      fetch_photos(*demo);
+      WiFi.disconnect(true);
+    }
+
+    Serial.printf("[air] demo feed: %u aircraft\n", demo->count);
+    Serial.flush();
+    const uint32_t demo_start = millis();
+    render_traffic(display, *demo);
+    Serial.printf("[air] demo render total %lu ms (panel %lu ms)\n",
+                  (unsigned long)(millis() - demo_start),
+                  (unsigned long)display.epd2.lastRefreshMs());
+    Serial.flush();
+    free(demo);
+    display.hibernate();
+#if AIR_TRAFFIC_CYCLE_MODES
+    // In cycling mode the demo must sleep too, otherwise the next view never
+    // gets a chance to run.
+    Serial.printf("[air] demo deep sleep %d s\n", AIR_TRAFFIC_UPDATE_S);
+    Serial.flush();
+    esp_sleep_enable_timer_wakeup((uint64_t)AIR_TRAFFIC_UPDATE_S * 1000000ULL);
+    esp_deep_sleep_start();
+#endif
+    return;
+  }
 #endif
 
   AirTrafficConfig config = {};
@@ -3375,10 +3486,16 @@ void airTrafficRun(epd::Display& display) {
     return;
   }
 
-  // Keep the ~2.4 KB aircraft table out of the 8 KB loop-task stack; the Wi-Fi
-  // manager and the TLS handshakes are stack-hungry.
-  static AirTrafficData data;
-  const bool fetched = fetch_traffic(data, config);
+  // Keep the aircraft table off the loop-task stack. Allocating it after
+  // Wi-Fi setup also keeps the static DRAM segment small enough for the
+  // cycling build.
+  AirTrafficData* data = (AirTrafficData*)calloc(1, sizeof(AirTrafficData));
+  if (!data) {
+    render_error_page(display, "Out of memory");
+    hibernate_and_sleep(display);
+    return;
+  }
+  const bool fetched = fetch_traffic(*data, config);
   // The radio is not needed while the panel refreshes (~26 s).
   // disconnect(true) already powers the interface down; calling
   // WiFi.mode(WIFI_OFF) as well triggers an "un-init" driver warning.
@@ -3387,14 +3504,15 @@ void airTrafficRun(epd::Display& display) {
   Serial.flush();
   if (fetched) {
     const uint32_t start = millis();
-    render_traffic(display, data);
+    render_traffic(display, *data);
     Serial.printf("[air] render total %lu ms (panel %lu ms)\n",
                   (unsigned long)(millis() - start),
                   (unsigned long)display.epd2.lastRefreshMs());
   } else {
-    Serial.printf("[air] fetch failed: %s\n", data.error);
-    render_error_page(display, data.error);
+    Serial.printf("[air] fetch failed: %s\n", data->error);
+    render_error_page(display, data->error);
   }
   Serial.flush();
+  free(data);
   hibernate_and_sleep(display);
 }

@@ -95,8 +95,9 @@ The official Good Display manual uses Arduino IDE:
 4. Upload a sketch that uses the pin definitions from
    `include/board_esp32_l_c73.h`.
 
-The air-traffic sources and the `huge_app` partition are set up for PlatformIO.
-The Arduino IDE alternative needs a matching 3 MB app partition.
+The air-traffic sources and the custom `partitions.csv` (3.5 MB application)
+are set up for PlatformIO. The Arduino IDE alternative needs a matching 3.5 MB
+app partition.
 
 Do not use the `ESP32epdx` examples for this panel: its current tree has no
 GDEP073E01 6-color driver. GxEPD2 includes `GxEPD2_730c_GDEP073E01`.
@@ -138,11 +139,11 @@ data source, portal, layout and limitations.
 
 ### Display modes (layout testing)
 
-`AIR_TRAFFIC_MODE` selects the poster layout at compile time:
+`AIR_TRAFFIC_MODE` selects the initial/fallback poster layout at compile time:
 
 | Mode | Layout |
 | --- | --- |
-| `0` (default) | Live feed, up to 4 aircraft |
+| `0` | Live feed, up to 4 aircraft |
 | `1` | Built-in demo feed, `AIR_TRAFFIC_DEMO_COUNT` aircraft |
 | `2` | One live aircraft, with flag, registration/distance and recent routes |
 | `3` | Two live aircraft |
@@ -150,22 +151,35 @@ data source, portal, layout and limitations.
 | `5` | Five live aircraft (3 on top, 2 centred below) |
 | `6` | Vector map centred on the configured location and radius |
 
+By default the display cycles through `2, 6, 3, 4, 5, 0` after every refresh.
+Override the sequence with:
+
 ```bash
-PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=2" pio run -t upload
-PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=6" pio run -t upload
-PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=1 -DAIR_TRAFFIC_DEMO_COUNT=5" \
+PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_CYCLE_SEQUENCE=2,6,3,4,5,0" \
+  pio run -t upload
+```
+
+Include demo mode with `1` in the sequence. Disable cycling with
+`-DAIR_TRAFFIC_CYCLE_MODES=0`; `AIR_TRAFFIC_MODE` then selects one fixed view:
+
+```bash
+PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_CYCLE_MODES=0 -DAIR_TRAFFIC_MODE=2" \
+  pio run -t upload
+PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_CYCLE_MODES=0 -DAIR_TRAFFIC_MODE=6" \
   pio run -t upload
 ```
 
 The demo feed renders the sample aircraft from the Overhead reference print
-without using adsb.lol. It may briefly join Wi-Fi to fetch card photos. The
-board does not deep-sleep in demo mode, so press RESET to redraw. Live modes
-fetch the feed and deep-sleep as usual. Mode 6 renders the map on-device from
-embedded Natural Earth data, so it makes no map HTTP request; if the map buffer
-cannot be allocated it shows `MAP DATA UNAVAILABLE`. Flash without the flag to
-return to mode 0. The legacy `-DAIR_TRAFFIC_DEMO=1` flag is still accepted as an
-alias for mode 1; the sample aircraft are in `fill_demo_data()` in
-`src/air_traffic.cpp`.
+without using adsb.lol. It may briefly join Wi-Fi to fetch card photos. A fixed
+demo build (`-DAIR_TRAFFIC_CYCLE_MODES=0 -DAIR_TRAFFIC_MODE=1`) does not
+deep-sleep, so press RESET to redraw; when demo is included in the cycling
+sequence it deep-sleeps like the other views. Live modes fetch the feed and
+deep-sleep as usual. Mode 6 renders the map on-device from embedded Natural
+Earth data, so it makes no map HTTP request; if the map buffer cannot be
+allocated it shows `MAP DATA UNAVAILABLE`. Flash without flags to use the
+default cycling sequence. The legacy `-DAIR_TRAFFIC_DEMO=1` flag is still
+accepted as an alias for mode 1; the sample aircraft are in
+`fill_demo_data()` in `src/air_traffic.cpp`.
 
 ## Refresh timing
 
@@ -195,6 +209,7 @@ see [docs/refresh-speed.md](docs/refresh-speed.md).
 
 ```
 platformio.ini                 PlatformIO / Arduino configuration
+partitions.csv                 3.5 MB application partition layout
 assets/aircraft/*.jpg          Bundled fallback aircraft photos
 assets/aircraft/ATTRIBUTION.md Photo sources and licences
 include/board_esp32_l_c73.h    Board pin definitions

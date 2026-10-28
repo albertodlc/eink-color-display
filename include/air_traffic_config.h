@@ -27,6 +27,21 @@
 #if AIR_TRAFFIC_MODE < 0 || AIR_TRAFFIC_MODE > 6
 #  error "AIR_TRAFFIC_MODE must be 0 (auto), 1 (demo), 2 (one), 3 (two), 4 (three), 5 (five) or 6 (map)"
 #endif
+
+// Cycle the displayed view after every refresh. The sequence can be overridden
+// with -DAIR_TRAFFIC_CYCLE_SEQUENCE=2,6,3,4,5,0. Mode 1 is the demo feed and
+// is intentionally not in the default sequence.
+#ifndef AIR_TRAFFIC_CYCLE_MODES
+#  define AIR_TRAFFIC_CYCLE_MODES 1
+#endif
+#ifndef AIR_TRAFFIC_CYCLE_SEQUENCE
+#  define AIR_TRAFFIC_CYCLE_SEQUENCE 2, 6, 3, 4, 5, 0
+#endif
+#if AIR_TRAFFIC_CYCLE_MODES
+#  define AIR_TRAFFIC_ALL_MODES 1
+#else
+#  define AIR_TRAFFIC_ALL_MODES 0
+#endif
 #undef AIR_TRAFFIC_DEMO
 #if AIR_TRAFFIC_MODE == 1
 #  define AIR_TRAFFIC_DEMO 1
@@ -47,37 +62,15 @@
 #define AIR_TRAFFIC_RADIUS_KM 100
 #define AIR_TRAFFIC_UPDATE_S 300  // >= 180 s vendor recommendation
 #define AIR_TRAFFIC_SLEEP 1       // deep sleep between updates
-#if AIR_TRAFFIC_MODE == 6
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_MODE == 6
 #  define AIR_TRAFFIC_MAX_AIRCRAFT 40  // map view has room for more markers
 #else
 #  define AIR_TRAFFIC_MAX_AIRCRAFT 10
 #endif
 #define AIR_TRAFFIC_PAGE_AIRCRAFT 5  // maximum cards any mode can draw
 
-#if AIR_TRAFFIC_MODE == 2
-#  define AIR_TRAFFIC_ACTIVE_CARDS 1
-#elif AIR_TRAFFIC_MODE == 3
-#  define AIR_TRAFFIC_ACTIVE_CARDS 2
-#elif AIR_TRAFFIC_MODE == 4
-#  define AIR_TRAFFIC_ACTIVE_CARDS 3
-#elif AIR_TRAFFIC_MODE == 5
-#  define AIR_TRAFFIC_ACTIVE_CARDS 5
-#elif AIR_TRAFFIC_MODE == 6
-#  define AIR_TRAFFIC_ACTIVE_CARDS 1  // map mode does not fetch cards
-#elif AIR_TRAFFIC_MODE == 1
-#  define AIR_TRAFFIC_ACTIVE_CARDS AIR_TRAFFIC_DEMO_COUNT
+#if AIR_TRAFFIC_ALL_MODES || AIR_TRAFFIC_DEMO
+#  define AIR_TRAFFIC_INCLUDE_DEMO 1
 #else
-#  define AIR_TRAFFIC_ACTIVE_CARDS 4
-#endif
-
-// The poster arrays and the photo-card pool are sized for PAGE_AIRCRAFT.
-// Clamp a larger demo count instead of letting it index past the arrays.
-#if AIR_TRAFFIC_ACTIVE_CARDS > AIR_TRAFFIC_PAGE_AIRCRAFT
-#  warning "AIR_TRAFFIC_ACTIVE_CARDS exceeds AIR_TRAFFIC_PAGE_AIRCRAFT; clamping"
-#  undef AIR_TRAFFIC_ACTIVE_CARDS
-#  define AIR_TRAFFIC_ACTIVE_CARDS AIR_TRAFFIC_PAGE_AIRCRAFT
-#endif
-#if AIR_TRAFFIC_ACTIVE_CARDS < 1
-#  undef AIR_TRAFFIC_ACTIVE_CARDS
-#  define AIR_TRAFFIC_ACTIVE_CARDS 1
+#  define AIR_TRAFFIC_INCLUDE_DEMO 0
 #endif

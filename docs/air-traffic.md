@@ -21,9 +21,8 @@ bundled side-view fallback photos otherwise.
 4. Request the adsb.lol point feed for the configured latitude, longitude and
    radius.
 5. Parse the JSON, keep the nearest `AIR_TRAFFIC_MAX_AIRCRAFT` aircraft and
-   show the nearest `AIR_TRAFFIC_ACTIVE_CARDS` selected by `AIR_TRAFFIC_MODE`.
-   In map mode the visible map rectangle, not the radius circle, selects which
-   aircraft are loaded.
+   show the active layout's card count. In map mode the visible map rectangle,
+   not the radius circle, selects which aircraft are loaded.
 6. Optionally resolve routes from adsbdb for the displayed aircraft
    (RTC-cached for two hours); missing routes fall back to distance/bearing.
    Map mode skips this and the photo lookup.
@@ -200,10 +199,11 @@ Compile-time defaults live in `include/air_traffic_config.h`:
 | `AIR_TRAFFIC_RADIUS_KM` | 100 | Default radius on first boot |
 | `AIR_TRAFFIC_UPDATE_S` | 300 | Deep-sleep interval |
 | `AIR_TRAFFIC_SLEEP` | 1 | Set to 0 to disable deep sleep |
-| `AIR_TRAFFIC_MAX_AIRCRAFT` | 10 | Nearest aircraft kept while parsing (40 in map mode) |
+| `AIR_TRAFFIC_MAX_AIRCRAFT` | 10 | Nearest kept while parsing; 40 in map or cycling builds |
 | `AIR_TRAFFIC_PAGE_AIRCRAFT` | 5 | Maximum cards any mode can draw |
-| `AIR_TRAFFIC_MODE` | 0 | 0 auto, 1 demo, 2 one, 3 two, 4 three, 5 five, 6 map |
-| `AIR_TRAFFIC_ACTIVE_CARDS` | mode-dependent | Cards drawn by the selected mode |
+| `AIR_TRAFFIC_MODE` | 0 | Initial/fallback view: 0 auto, 1 demo, 2 one, 3 two, 4 three, 5 five, 6 map |
+| `AIR_TRAFFIC_CYCLE_MODES` | 1 | Cycle the view after every refresh |
+| `AIR_TRAFFIC_CYCLE_SEQUENCE` | `2,6,3,4,5,0` | View order when cycling |
 | `AIR_TRAFFIC_DEMO` | derived | 1 only when `AIR_TRAFFIC_MODE=1` |
 | `AIR_TRAFFIC_DEMO_COUNT` | 4 | Demo aircraft: 1-5 |
 
@@ -212,7 +212,9 @@ validated before they are saved.
 
 ### Display modes
 
-`AIR_TRAFFIC_MODE` selects the poster composition at compile time:
+`AIR_TRAFFIC_MODE` selects the initial/fallback poster composition. By default
+the firmware also cycles the view after every refresh using
+`AIR_TRAFFIC_CYCLE_SEQUENCE` (`2,6,3,4,5,0`):
 
 | Mode | Aircraft | Layout |
 | --- | --- | --- |
@@ -222,19 +224,27 @@ validated before they are saved.
 | `3` | 2 | two feature rows |
 | `4` | 3 | 2x2 grid with the last card centred |
 | `5` | 5 | three on top, two centred below |
-| `6` | live, up to 10 | vector map with aircraft markers |
+| `6` | live, up to 40 | vector map with aircraft markers |
 
 ```bash
-PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=2" pio run -t upload
-PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=5" pio run -t upload
-PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=6" pio run -t upload
+# Default: cycle through 2,6,3,4,5,0
+pio run -t upload
+
+# Custom cycle, including demo
+PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_CYCLE_SEQUENCE=2,6,1,3,0" \
+  pio run -t upload
+
+# Fixed view
+PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_CYCLE_MODES=0 -DAIR_TRAFFIC_MODE=6" \
+  pio run -t upload
 ```
 
-Mode `0` is the default. `AIR_TRAFFIC_ACTIVE_CARDS` is derived from the mode;
-the poster arrays are sized for five cards, and a larger demo count is clamped
-with a build warning. `AIR_TRAFFIC_DEMO` is no longer set directly: it is 1 only
-in mode 1, and the legacy `-DAIR_TRAFFIC_DEMO=1` flag is accepted as an alias
-for mode 1. Flash without a flag to return to the live auto layout.
+The cycle index survives deep sleep but restarts at the first sequence entry
+after a power-on reset. Demo mode is excluded from the default sequence because
+it uses the built-in sample aircraft; add `1` if you want it in the rotation.
+When demo is in the cycle it deep-sleeps like the other views; a fixed demo
+build stays awake for layout testing. `AIR_TRAFFIC_DEMO` is derived from mode 1,
+and the legacy `-DAIR_TRAFFIC_DEMO=1` flag is accepted as an alias for mode 1.
 
 #### Demo feed
 
@@ -259,18 +269,20 @@ The sample data is in `fill_demo_data()` in `src/air_traffic.cpp`:
 | QFA478 | Boeing 737-800 | 10,900 ft climbing | Melbourne to Sydney |
 
 The demo timestamp is `2026-10-22 18:28 UTC` (Thursday), matching the reference.
-The panel hibernates after the render but the ESP32 does not deep-sleep; press
-RESET to redraw.
+A fixed demo build hibernates but does not deep-sleep; press RESET to redraw.
+When demo is included in the cycling sequence it deep-sleeps and advances like
+the other views.
 
-Use `AIR_TRAFFIC_DEMO_COUNT=1` to `5` to exercise the adaptive layouts:
+Use `AIR_TRAFFIC_DEMO_COUNT=1` to `5` to exercise the adaptive layouts. A fixed
+demo build needs cycling disabled:
 
 ```bash
-PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_MODE=1 -DAIR_TRAFFIC_DEMO_COUNT=5" \
+PLATFORMIO_BUILD_FLAGS="-DAIR_TRAFFIC_CYCLE_MODES=0 -DAIR_TRAFFIC_MODE=1 -DAIR_TRAFFIC_DEMO_COUNT=5" \
   pio run -t upload
 ```
 
-The demo build still contains the Wi-Fi/TLS code, so its flash size is
-unchanged.
+The combined cycling build contains the Wi-Fi/TLS code, the photo pipeline and
+the vector map data, so it uses the 3.5 MB application partition.
 
 #### Map mode
 
@@ -307,15 +319,18 @@ Regenerate `src/vector_map.h` with `python3 tools/make_vector_map.py`.
 
 ## Partition and dependencies
 
-Wi-Fi, TLS, WiFiManager and ArduinoJson push the application above the default
-1.3 MB partition. `platformio.ini` uses `huge_app.csv` (3 MB application on the
-4 MB flash):
+Wi-Fi, TLS, WiFiManager, the photo pipeline and the embedded vector map push
+the application above the default 1.3 MB partition and above the 3 MB
+`huge_app` layout. `platformio.ini` uses `partitions.csv` (3.5 MB application
+on the 4 MB flash):
 
 ```ini
-board_build.partitions = huge_app.csv
+board_build.partitions = partitions.csv
 ```
 
-Measured build: about **1.45 MB flash (46%)** and **113 KB static RAM (35%)**.
+Measured cycling build: about **3.30 MB flash (90%)** and **118 KB static RAM
+(36%)**. The partition table keeps NVS at the same offset, so Wi-Fi credentials
+and the location survive a normal USB flash.
 
 ### PlatformIO / ESP32 Arduino 3.x note
 
@@ -342,6 +357,7 @@ treats its `src` subfolder as a separate library and the WiFi build still fails.
 Representative serial log (location/radius replaced with a generic example):
 
 ```text
+[air] view mode 2
 [air] Wi-Fi connect
 [air] location 51.50740, -0.12780 radius 100 km
 [air] GET https://api.adsb.lol/v2/lat/51.50740/lon/-0.12780/dist/28
@@ -375,13 +391,14 @@ image : air traffic (demo)
 [air] demo render total 27392 ms (panel 26015 ms)
 ```
 
-The demo panel hibernates but the ESP32 stays awake, so the image remains and
-RESET redraws it.
+The demo panel hibernates. A fixed demo build stays awake so RESET redraws it;
+in a cycling build it deep-sleeps and advances to the next view.
 
 Map mode rasterises the embedded Natural Earth vectors after Wi-Fi is
 disconnected:
 
 ```text
+[air] view mode 6
 [air] 37 aircraft in map view (37 stored)
 [air] vector map q=-1035..-130, 8463..8858 in 6653 ms, heap 124324
 [air] render total 35852 ms (panel 26233 ms)
@@ -418,7 +435,7 @@ required.
   portal.
 - The public feed can be unavailable or rate-limited; the panel shows an error
   page and retries on the next wake.
-- No OTA with `huge_app.csv`; flash over USB.
+- No OTA with `partitions.csv`; flash over USB.
 - Deep sleep resets the ESP32. The first update after wake reconnects Wi-Fi and
   can take a few seconds before the panel starts refreshing.
 - The panel must not be refreshed below 0 °C, and repeated full refreshes are
