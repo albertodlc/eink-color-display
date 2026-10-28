@@ -1724,7 +1724,8 @@ void render_error_page(epd::Display& display, const char* message) {
 // small document, independent of the radius.
 class AdsbFeedReader {
  public:
-  explicit AdsbFeedReader(Stream& stream) : stream_(stream) {}
+  AdsbFeedReader(Stream& stream, int body_size)
+      : stream_(stream), remaining_(body_size) {}
 
   bool parse(AirTrafficData& data, const AirTrafficConfig& config) {
     JsonDocument filter;
@@ -1744,7 +1745,10 @@ class AdsbFeedReader {
     uint64_t now = 0;
     bool saw_ac = false;
 
-    if (!skip_space() || get() != '{') return false;
+    if (!skip_space() || get() != '{') {
+      Serial.println("[air] feed: no object");
+      return false;
+    }
     for (;;) {
       if (!skip_space()) return false;
       const int c = peek();
@@ -1758,20 +1762,34 @@ class AdsbFeedReader {
       }
 
       char key[16];
-      if (!read_string(key, sizeof(key))) return false;
-      if (!skip_space() || get() != ':') return false;
+      if (!read_string(key, sizeof(key))) {
+        Serial.println("[air] feed: bad key");
+        return false;
+      }
+      if (!skip_space() || get() != ':') {
+        Serial.println("[air] feed: missing colon");
+        return false;
+      }
 
       if (strcmp(key, "ac") == 0) {
         saw_ac = true;
         if (!skip_space()) return false;
         if (peek() == '[') {
-          if (!parse_aircraft_array(data, config, filter, doc)) return false;
+          if (!parse_aircraft_array(data, config, filter, doc)) {
+            Serial.println("[air] feed: aircraft array");
+            return false;
+          }
         } else if (!skip_value()) {
+          Serial.println("[air] feed: ac value");
           return false;
         }
       } else if (strcmp(key, "now") == 0) {
-        if (!read_uint64(now)) return false;
+        if (!read_uint64(now)) {
+          Serial.println("[air] feed: now");
+          return false;
+        }
       } else if (!skip_value()) {
+        Serial.printf("[air] feed: skip %s\n", key);
         return false;
       }
     }
@@ -1783,8 +1801,17 @@ class AdsbFeedReader {
 
  private:
   int read_byte() {
-    char c = 0;
-    return stream_.readBytes(&c, 1) == 1 ? (int)(uint8_t)c : -1;
+    const uint32_t started = millis();
+    while (remaining_ > 0) {
+      char c = 0;
+      if (stream_.readBytes(&c, 1) == 1) {
+        remaining_--;
+        return (int)(uint8_t)c;
+      }
+      if (millis() - started > 3000) break;
+      delay(1);
+    }
+    return -1;
   }
 
   int get() {
@@ -1933,12 +1960,18 @@ class AdsbFeedReader {
   bool parse_aircraft_array(AirTrafficData& data,
                             const AirTrafficConfig& config,
                             JsonDocument& filter, JsonDocument& doc) {
-    if (!skip_space() || get() != '[') return false;
+    if (!skip_space() || get() != '[') {
+      Serial.println("[air] feed: array start");
+      return false;
+    }
     // An aircraft object is ~700 bytes in the current feed; keep enough room
     // for extra fields without putting the buffer on the 8 KB task stack.
     static char object[2048];
     for (;;) {
-      if (!skip_space()) return false;
+      if (!skip_space()) {
+        Serial.println("[air] feed: array space");
+        return false;
+      }
       const int c = peek();
       if (c == ']') {
         get();
@@ -1955,7 +1988,10 @@ class AdsbFeedReader {
         }
         continue;
       }
-      if (!skip_value()) return false;
+      if (!skip_value()) {
+        Serial.println("[air] feed: array element");
+        return false;
+      }
     }
   }
 
@@ -2009,17 +2045,33 @@ class AdsbFeedReader {
 
     float km = 0.0f;
     float bearing = 0.0f;
+    const double lat = doc["lat"] | 0.0;
+    const double lon = doc["lon"] | 0.0;
     const float dst_nm = doc["dst"] | -1.0f;
     if (dst_nm >= 0.0f) {
       km = dst_nm * 1.852f;
       bearing = doc["dir"] | 0.0f;
     } else {
-      const double lat = doc["lat"] | 0.0;
-      const double lon = doc["lon"] | 0.0;
       if (lat == 0.0 && lon == 0.0) return;
       distance_bearing(config.lat, config.lon, lat, lon, km, bearing);
     }
+#if AIR_TRAFFIC_MODE == 6
+    // Map mode loads everything inside the visible map rectangle, including
+    // aircraft outside the configured radius.
+    const float half_lat = (float)config.radius_km * 1.1f / 111.32f;
+    float cos_lat = cosf((float)config.lat * PI / 180.0f);
+    if (cos_lat < 0.05f) cos_lat = 0.05f;
+    const float half_lon =
+        half_lat * (float)epd::kWidth / (float)epd::kHeight / cos_lat;
+    if (lat == 0.0 && lon == 0.0) {
+      if (km > (float)config.radius_km * 2.2f) return;
+    } else if (fabs(lat - config.lat) > half_lat ||
+               fabs(lon - config.lon) > half_lon) {
+      return;
+    }
+#else
     if (km > config.radius_km + 0.5f) return;
+#endif
     data.total_within_radius++;
 
     AirTrafficAircraft out = {};
@@ -2094,6 +2146,7 @@ class AdsbFeedReader {
   }
 
   Stream& stream_;
+  int remaining_ = 0;
   int lookahead_ = -2;
 };
 
@@ -2109,7 +2162,13 @@ bool fetch_traffic(AirTrafficData& data, const AirTrafficConfig& config) {
     return false;
   }
 
-  const int nm = (int)ceilf(config.radius_km / 1.852f);
+  int query_radius_km = config.radius_km;
+#if AIR_TRAFFIC_MODE == 6
+  // The map view is a 5:3 rectangle, so its corners are farther than the
+  // configured radius. Query the covering circle and filter to the grid below.
+  query_radius_km = (int)ceilf((float)config.radius_km * 2.2f);
+#endif
+  const int nm = (int)ceilf(query_radius_km / 1.852f);
   char url[160];
   snprintf(url, sizeof(url),
            "https://api.adsb.lol/v2/lat/%.5f/lon/%.5f/dist/%d", config.lat,
@@ -2153,7 +2212,7 @@ bool fetch_traffic(AirTrafficData& data, const AirTrafficConfig& config) {
 
   // Parse one aircraft object at a time so the heap cost does not grow with
   // the radius. The reader keeps only the nearest AIR_TRAFFIC_MAX_AIRCRAFT.
-  AdsbFeedReader reader(*stream);
+  AdsbFeedReader reader(*stream, body_size);
   const uint32_t parse_started = millis();
   const bool parsed = reader.parse(data, config);
   const uint32_t parse_ms = millis() - parse_started;
@@ -2182,8 +2241,13 @@ bool fetch_traffic(AirTrafficData& data, const AirTrafficConfig& config) {
   }
   fetch_photos(data);
 #endif
+#if AIR_TRAFFIC_MODE == 6
+  Serial.printf("[air] %u aircraft in map view (%u stored)\n",
+                data.total_within_radius, data.count);
+#else
   Serial.printf("[air] %u aircraft within %d km (%u stored)\n",
                 data.total_within_radius, config.radius_km, data.count);
+#endif
   return true;
 }
 
@@ -2529,12 +2593,17 @@ void draw_card(epd::Display& display, const PosterCard& card,
 }
 
 void draw_header(epd::Display& display, const AirTrafficData& data) {
-  // N counts every aircraft inside the selected radius, not just the nearest
-  // ones that fit on the poster.
+  // N counts every aircraft in the selected area (the radius for poster modes,
+  // the map rectangle for map mode), not just the nearest stored ones.
   char title[80];
+#if AIR_TRAFFIC_MODE == 6
+  snprintf(title, sizeof(title), "MAP VIEW - %u AIRCRAFT IN THE AIR NOW",
+           (unsigned)data.total_within_radius);
+#else
   snprintf(title, sizeof(title),
            "WITHIN %.0f KM - %u AIRCRAFT IN THE AIR NOW", data.radius_km,
            (unsigned)data.total_within_radius);
+#endif
   display.setTextSize(2);
   display.setTextColor(GxEPD_BLACK);
   display.setCursor(18, kHeaderTitleY);

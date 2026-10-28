@@ -119,10 +119,11 @@ The page is a print-style poster rather than a radar:
   `on the ground`.
 - Mode 6 draws a clean vector map centred on the configured location, with
   the aircraft plotted at their distance and bearing and oriented by their
-  track. The map uses embedded Natural Earth coastlines, country and district
-  borders, rivers, district names and city names, so it has no tile-service
-  labels or raster artifacts. Aircraft identifiers use high-contrast black
-  labels with a small country flag.
+  track. The map rectangle, not the radius, selects which aircraft are loaded.
+  The map uses embedded Natural Earth coastlines, country and district borders,
+  rivers, district names and city names, so it has no tile-service labels or
+  raster artifacts. Aircraft identifiers use high-contrast black labels with a
+  small country flag.
 - The feed supplies the callsign, type, altitude, vertical rate and position.
 - The header count is the total within the radius; the poster shows as many
   aircraft as the selected display mode allows (four by default).

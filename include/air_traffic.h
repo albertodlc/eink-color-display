@@ -22,7 +22,7 @@ struct AirTrafficAircraft {
 struct AirTrafficData {
   AirTrafficAircraft aircraft[AIR_TRAFFIC_MAX_AIRCRAFT];
   uint8_t count;               // stored and sorted, capped at MAX_AIRCRAFT
-  uint16_t total_within_radius;  // may be larger than count
+  uint16_t total_within_radius;  // radius in poster modes, map grid in map mode
   float radius_km;
   double lat;
   double lon;

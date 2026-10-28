@@ -22,6 +22,8 @@ bundled side-view fallback photos otherwise.
    radius.
 5. Parse the JSON, keep the nearest `AIR_TRAFFIC_MAX_AIRCRAFT` aircraft and
    show the nearest `AIR_TRAFFIC_ACTIVE_CARDS` selected by `AIR_TRAFFIC_MODE`.
+   In map mode the visible map rectangle, not the radius circle, selects which
+   aircraft are loaded.
 6. Optionally resolve routes from adsbdb for the displayed aircraft
    (RTC-cached for two hours); missing routes fall back to distance/bearing.
    Map mode skips this and the photo lookup.
@@ -65,7 +67,10 @@ https://api.adsb.lol/v2/lat/{lat}/lon/{lon}/dist/{nm}
 
 - No API key.
 - `radius_km` is converted to nautical miles with `ceil(km / 1.852)` because
-  the feed uses nautical miles.
+  the feed uses nautical miles. In map mode the request radius is expanded to
+  2.2x the configured radius so the corners of the 5:3 map rectangle are
+  covered; the parsed aircraft are then filtered to that rectangle. Poster
+  modes keep the configured radius.
 - The response is a point query: `ac` is the aircraft array, `now` is the
   server time in epoch **milliseconds**, and each aircraft can include `dst`
   (distance in nm) and `dir` (bearing in degrees) relative to the requested
@@ -127,8 +132,9 @@ The page imitates a framed print:
 ```
 
 - The header shows the radius, the number of aircraft within it, and the feed
-  time/date (UTC). The date comes from the feed's `now` field, so no RTC or NTP
-  is needed.
+  time/date (UTC). Map mode replaces the radius text with `MAP VIEW` and counts
+  aircraft in the map rectangle. The date comes from the feed's `now` field, so
+  no RTC or NTP is needed.
 - `AIR_TRAFFIC_MODE` selects the poster composition. One aircraft: one large
   feature card with the airliner above two text columns. The left column has
   callsign/type, altitude, route or distance, and a country flag plus the
@@ -145,8 +151,9 @@ The page imitates a framed print:
 - Live photos come from JetPhotos/Planespotters; when unavailable, a bundled
   side-view photo for the aircraft family is used. Sources and licences are in
   [`assets/aircraft/ATTRIBUTION.md`](../assets/aircraft/ATTRIBUTION.md).
-- The header count is the total within the radius; the poster shows the number
-  of aircraft allowed by the selected mode.
+- The header count is the total within the radius in poster modes and within
+  the map rectangle in map mode; the display shows the nearest aircraft that
+  fit or the nearest ten in map mode.
 
 The details line uses the route when adsbdb knows it (`Dublin to Milan`) and
 `12 km / 210 deg` otherwise. Routes are often missing for positioning, ferry
@@ -269,7 +276,10 @@ unchanged.
 Mode 6 renders a clean vector map centred on the configured latitude/longitude
 from the Natural Earth 1:50m dataset embedded in the firmware. It makes no map
 HTTP request. The map covers 10% more than the selected radius and has the same
-5:3 aspect as the panel. The firmware draws:
+5:3 aspect as the panel. In this mode the map rectangle is the aircraft
+selection area, not the radius: the feed is queried over a 2.2x covering circle
+and filtered to the rectangle, so aircraft outside the radius but inside the
+map are included. Poster modes keep the configured radius. The firmware draws:
 
 - white land, blue water, black coastlines and country borders, green district
   boundaries, dotted blue rivers and black district names;
@@ -278,7 +288,8 @@ HTTP request. The map covers 10% more than the selected radius and has the same
 - each aircraft at its ADS-B distance and bearing, rotated by its ground track;
 - aircraft callsigns on black labels with white text and a small country flag;
 - the home marker, north and `(c) Natural Earth`;
-- the usual `WITHIN ... KM - N AIRCRAFT` header.
+- the `MAP VIEW - N AIRCRAFT` header, where N counts aircraft in the map
+  rectangle.
 
 There is no range circle or other legend over the map. The vector image is
 rasterised once per wake into a 54 KB two-bit buffer at 600x360, scaled to the
@@ -370,8 +381,9 @@ Map mode rasterises the embedded Natural Earth vectors after Wi-Fi is
 disconnected:
 
 ```text
-[air] vector map q=-1035..-130, 8463..8858 in 6656 ms, heap 127748
-[air] render total 37123 ms (panel 26023 ms)
+[air] 38 aircraft in map view (10 stored)
+[air] vector map q=-1035..-130, 8463..8858 in 6666 ms, heap 127824
+[air] render total 35692 ms (panel 26231 ms)
 ```
 
 The background is a 600x360 two-bit buffer (54 KB) with four inks, scaled to
